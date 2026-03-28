@@ -10,6 +10,11 @@ use crate::{
 /// Maximum UDP datagram we expect: VXLAN header + inner Ethernet frame (jumbo-safe).
 const MAX_RECV_BUF: usize = 65535;
 
+/// Socket receive buffer size (4 MiB).
+const SO_RCVBUF_SIZE: libc::c_int = 4 * 1024 * 1024;
+/// Socket send buffer size (4 MiB).
+const SO_SNDBUF_SIZE: libc::c_int = 4 * 1024 * 1024;
+
 /// Forwarding database: maps destination MAC to remote VTEP(s).
 ///
 /// - Unicast entries (`mac != 00:00:00:00:00:00`) map to a single VTEP.
@@ -78,6 +83,8 @@ impl VxlanServer {
     /// Create a new server from the parsed config.
     pub async fn bind(config: &config::Config) -> io::Result<Self> {
         let socket = UdpSocket::bind(config.server.listen).await?;
+        set_sock_buf_size(socket.as_raw_fd())?;
+
         let fdb = Fdb::from_entries(&config.fdb);
 
         tracing::info!(
@@ -99,6 +106,9 @@ impl VxlanServer {
     }
 
     /// Run the server, forwarding packets in both directions until cancelled.
+    ///
+    /// After each readiness notification, drains all available packets before
+    /// re-entering the event loop to reduce epoll overhead.
     pub async fn run(mut self) -> io::Result<()> {
         let vxlan_hdr = VxlanHdr::new(self.vni);
 
@@ -108,42 +118,44 @@ impl VxlanServer {
         loop {
             tokio::select! {
                 // RX path: UDP → feth (decapsulation)
-                result = self.socket.recv_from(&mut udp_buf) => {
-                    let (n, peer) = result?;
-                    self.handle_rx(&udp_buf[..n], peer);
+                result = self.socket.readable() => {
+                    result?;
+                    // Drain all queued datagrams before re-polling.
+                    loop {
+                        match self.socket.try_recv_from(&mut udp_buf) {
+                            Ok((n, peer)) => self.handle_rx(&udp_buf[..n], peer),
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(e) => return Err(e),
+                        }
+                    }
                 }
 
                 // TX path: feth → UDP (encapsulation)
                 result = self.feth_io.recv(&mut feth_buf) => {
                     let n = result?;
-                    let frame = &feth_buf[..n];
-                    self.handle_tx(&vxlan_hdr, frame).await;
+                    self.handle_tx(&vxlan_hdr, &feth_buf[..n]).await;
                 }
             }
         }
     }
 
     /// Handle an incoming UDP datagram: parse VXLAN, validate VNI, inject inner frame.
-    fn handle_rx(&self, data: &[u8], _: SocketAddr) -> Option<Vec<u8>> {
+    fn handle_rx(&self, data: &[u8], _: SocketAddr) {
         let (vxlan, inner_frame) = match VxlanHdr::from_bytes(data) {
             Ok(parsed) => parsed,
-            Err(_) => return None,
+            Err(_) => return,
         };
 
         if vxlan.vni() != self.vni {
-            return None;
+            return;
         }
 
         if inner_frame.len() < protocol::ETH_HEADER_LEN {
-            return None;
+            return;
         }
 
-        match self.feth_io.send(inner_frame) {
-            Ok(_) => Some(inner_frame.to_vec()),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to inject frame into feth");
-                None
-            }
+        if let Err(e) = self.feth_io.send(inner_frame) {
+            tracing::warn!(error = %e, "failed to inject frame into feth");
         }
     }
 
@@ -173,6 +185,7 @@ impl VxlanServer {
             let result = self.socket.try_io(Interest::WRITABLE, || {
                 sendmsg_udp(self.socket.as_raw_fd(), &[hdr_bytes, frame], remote)
             });
+
             if let Err(e) = result {
                 tracing::warn!(
                     error = %e,
@@ -191,15 +204,18 @@ union SockAddrStorage {
     v6: libc::sockaddr_in6,
 }
 
-/// Send a UDP datagram assembled from multiple `iovec` slices via `sendmsg(2)`.
-fn sendmsg_udp(fd: std::os::fd::RawFd, slices: &[&[u8]], dest: SocketAddr) -> io::Result<usize> {
-    let iov: Vec<libc::iovec> = slices
-        .iter()
-        .map(|s| libc::iovec {
-            iov_base: s.as_ptr() as *mut libc::c_void,
-            iov_len: s.len(),
-        })
-        .collect();
+/// Send a UDP datagram from exactly two buffers (header + payload) via `sendmsg(2)`.
+fn sendmsg_udp(fd: std::os::fd::RawFd, slices: &[&[u8]; 2], dest: SocketAddr) -> io::Result<usize> {
+    let iov = [
+        libc::iovec {
+            iov_base: slices[0].as_ptr() as *mut libc::c_void,
+            iov_len: slices[0].len(),
+        },
+        libc::iovec {
+            iov_base: slices[1].as_ptr() as *mut libc::c_void,
+            iov_len: slices[1].len(),
+        },
+    ];
 
     let mut storage: SockAddrStorage = unsafe { std::mem::zeroed() };
     let addr_len = match dest {
@@ -244,4 +260,32 @@ fn sendmsg_udp(fd: std::os::fd::RawFd, slices: &[&[u8]], dest: SocketAddr) -> io
     } else {
         Ok(ret as usize)
     }
+}
+
+/// Enlarge the kernel socket buffers to reduce packet drops under load.
+fn set_sock_buf_size(fd: std::os::fd::RawFd) -> io::Result<()> {
+    for (opt, size) in [
+        (libc::SO_RCVBUF, SO_RCVBUF_SIZE),
+        (libc::SO_SNDBUF, SO_SNDBUF_SIZE),
+    ] {
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                std::ptr::addr_of!(size).cast(),
+                std::mem::size_of_val(&size) as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            let e = io::Error::last_os_error();
+            tracing::warn!(
+                opt = if opt == libc::SO_RCVBUF { "SO_RCVBUF" } else { "SO_SNDBUF" },
+                size,
+                error = %e,
+                "failed to set socket buffer size, using default",
+            );
+        }
+    }
+    Ok(())
 }
