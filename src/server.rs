@@ -1,23 +1,58 @@
-use std::{io, net::SocketAddr, os::fd::AsRawFd};
+use std::{collections::HashMap, io, net::SocketAddr, os::fd::AsRawFd};
 
 use tokio::{io::Interest, net::UdpSocket};
 
-use crate::protocol::{self, VxlanHdr};
+use crate::{
+    config::{self, FdbEntry},
+    protocol::{self, EthernetHeader, VxlanHdr},
+};
 
 /// Maximum UDP datagram we expect: VXLAN header + inner Ethernet frame (jumbo-safe).
 const MAX_RECV_BUF: usize = 65535;
 
-/// Configuration for a VXLAN server instance.
-#[derive(Debug, Clone)]
-pub struct VxlanServerConfig {
-    /// Local address to bind the UDP socket (e.g. "0.0.0.0:4789").
-    pub listen_addr: SocketAddr,
-    /// The VNI this server handles. Packets with a different VNI are dropped.
-    pub vni: u32,
-    /// Name of the feth I/O-side interface to inject/capture frames.
-    pub feth_ifname: String,
-    /// Remote VTEP address to send encapsulated frames to.
-    pub remote_vtep: SocketAddr,
+/// Forwarding database: maps destination MAC to remote VTEP(s).
+///
+/// - Unicast entries (`mac != 00:00:00:00:00:00`) map to a single VTEP.
+/// - BUM entries (`mac == 00:00:00:00:00:00`) are collected into a flood list;
+///   frames with no unicast match are sent to all BUM destinations.
+#[derive(Debug)]
+struct Fdb {
+    /// Exact MAC → VTEP mapping.
+    unicast: HashMap<[u8; 6], SocketAddr>,
+    /// Flood list for broadcast / unknown-unicast / multicast.
+    bum: Vec<SocketAddr>,
+}
+
+impl Fdb {
+    fn from_entries(entries: &[FdbEntry]) -> Self {
+        let mut unicast = HashMap::new();
+        let mut bum = Vec::new();
+        for entry in entries {
+            if entry.is_bum() {
+                bum.push(entry.dst);
+            } else {
+                unicast.insert(entry.mac, entry.dst);
+            }
+        }
+        Self { unicast, bum }
+    }
+
+    /// Look up destinations for a given destination MAC.
+    ///
+    /// Returns a single VTEP for known unicast, or the full BUM flood list
+    /// for broadcast/multicast/unknown destinations.
+    fn lookup(&self, dst_mac: &[u8; 6]) -> &[SocketAddr] {
+        // Broadcast / multicast — always flood.
+        if dst_mac[0] & 0x01 != 0 {
+            return &self.bum;
+        }
+        // Known unicast.
+        if let Some(addr) = self.unicast.get(dst_mac) {
+            return std::slice::from_ref(addr);
+        }
+        // Unknown unicast — flood.
+        &self.bum
+    }
 }
 
 /// A userspace VXLAN tunnel server.
@@ -31,38 +66,41 @@ pub struct VxlanServerConfig {
 /// ```
 ///
 /// RX path: UDP recv → parse VXLAN header → validate VNI → write inner frame to feth
-/// TX path: feth recv → prepend VXLAN header → UDP send to remote VTEP
+/// TX path: feth recv → FDB lookup → VXLAN encap → UDP sendmsg to VTEP(s)
 pub struct VxlanServer {
-    config: VxlanServerConfig,
+    vni: u32,
     socket: UdpSocket,
     feth_io: feth_rs::feth_tokio::AsyncFethIO,
+    fdb: Fdb,
 }
 
 impl VxlanServer {
-    /// Create a new server, binding the UDP socket and opening the feth interface.
-    pub async fn bind(config: VxlanServerConfig) -> io::Result<Self> {
-        let socket = UdpSocket::bind(config.listen_addr).await?;
+    /// Create a new server from the parsed config.
+    pub async fn bind(config: &config::Config) -> io::Result<Self> {
+        let socket = UdpSocket::bind(config.server.listen).await?;
+        let fdb = Fdb::from_entries(&config.fdb);
+
         tracing::info!(
-            listen = %config.listen_addr,
-            vni = config.vni,
-            feth = %config.feth_ifname,
-            remote = %config.remote_vtep,
+            listen = %config.server.listen,
+            vni = config.server.vni,
+            feth = %config.interface.io_name(),
+            bum_peers = fdb.bum.len(),
+            unicast_entries = fdb.unicast.len(),
             "vxlan server bound",
         );
-        let feth_io = feth_rs::feth_tokio::AsyncFethIO::open(&config.feth_ifname)?;
+
+        let feth_io = feth_rs::feth_tokio::AsyncFethIO::open(&config.interface.io_name())?;
         Ok(Self {
-            config,
+            vni: config.server.vni,
             socket,
             feth_io,
+            fdb,
         })
     }
 
     /// Run the server, forwarding packets in both directions until cancelled.
-    ///
-    /// Uses `tokio::select!` to multiplex between the UDP socket and the feth
-    /// interface in a single loop, avoiding ownership splitting.
     pub async fn run(mut self) -> io::Result<()> {
-        let vxlan_hdr = VxlanHdr::new(self.config.vni);
+        let vxlan_hdr = VxlanHdr::new(self.vni);
 
         let mut udp_buf = vec![0u8; MAX_RECV_BUF];
         let mut feth_buf = vec![0u8; MAX_RECV_BUF];
@@ -86,14 +124,13 @@ impl VxlanServer {
     }
 
     /// Handle an incoming UDP datagram: parse VXLAN, validate VNI, inject inner frame.
-    /// Returns the injected frame bytes (for BPF feedback detection).
     fn handle_rx(&self, data: &[u8], _: SocketAddr) -> Option<Vec<u8>> {
         let (vxlan, inner_frame) = match VxlanHdr::from_bytes(data) {
             Ok(parsed) => parsed,
             Err(_) => return None,
         };
 
-        if vxlan.vni() != self.config.vni {
+        if vxlan.vni() != self.vni {
             return None;
         }
 
@@ -110,7 +147,7 @@ impl VxlanServer {
         }
     }
 
-    /// Handle an outgoing frame from feth: prepend VXLAN header, send via UDP.
+    /// Handle an outgoing frame from feth: FDB lookup → VXLAN encap → sendmsg.
     ///
     /// Uses `sendmsg` with `iovec` to scatter-gather the VXLAN header and
     /// inner frame, avoiding a copy into a contiguous buffer.
@@ -119,20 +156,30 @@ impl VxlanServer {
             return;
         }
 
-        // Wait for the socket to be writable, then do the sendmsg syscall.
-        self.socket.writable().await.ok();
-        let result = self.socket.try_io(Interest::WRITABLE, || {
-            sendmsg_udp(
-                self.socket.as_raw_fd(),
-                &[vxlan_hdr.as_bytes(), frame],
-                self.config.remote_vtep,
-            )
-        });
+        let dst_mac = match EthernetHeader::from_bytes(frame) {
+            Ok((eth, _)) => eth.dst_mac,
+            Err(_) => return,
+        };
 
-        match result {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to send vxlan datagram");
+        let destinations = self.fdb.lookup(&dst_mac);
+        if destinations.is_empty() {
+            return;
+        }
+
+        let hdr_bytes = vxlan_hdr.as_bytes();
+        self.socket.writable().await.ok();
+
+        for &remote in destinations {
+            let result = self.socket.try_io(Interest::WRITABLE, || {
+                sendmsg_udp(self.socket.as_raw_fd(), &[hdr_bytes, frame], remote)
+            });
+            if let Err(e) = result {
+                tracing::warn!(
+                    error = %e,
+                    dst = %config::format_mac(&dst_mac),
+                    remote = %remote,
+                    "failed to send vxlan datagram",
+                );
             }
         }
     }

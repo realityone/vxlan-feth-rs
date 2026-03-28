@@ -1,77 +1,87 @@
+pub mod config;
 pub mod protocol;
 pub mod server;
 
-use std::net::SocketAddr;
+use std::path::PathBuf;
 
+use clap::{Parser, Subcommand};
 use feth_rs::feth::Feth;
-use server::VxlanServerConfig;
 
-const FETH_IO_UNIT: u32 = 101;
-const FETH_IP_UNIT: u32 = 100;
-const INNER_ADDR: &str = "10.0.0.2";
-const INNER_PREFIX: u8 = 24;
-const MTU: u32 = 1450;
+#[derive(Parser)]
+#[command(name = "vxlan-feth", about = "Userspace VXLAN tunnel over feth")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-/// Create and configure the feth pair using feth-rs.
-fn setup_interfaces() -> Result<(Feth, Feth), feth_rs::feth::Error> {
+#[derive(Subcommand)]
+enum Command {
+    /// Manage the VXLAN server.
+    Server {
+        #[command(subcommand)]
+        action: ServerAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServerAction {
+    /// Start the VXLAN server.
+    Up {
+        /// Path to the YAML config file.
+        config: PathBuf,
+    },
+}
+
+/// Create and configure the feth pair from config.
+fn setup_interfaces(iface: &config::InterfaceConfig) -> Result<(Feth, Feth), feth_rs::feth::Error> {
+    let io_name = iface.io_name();
+    let ip_name = iface.ip_name();
+
     // Clean up any leftover interfaces first.
-    if let Ok(old) = Feth::from_existing(format!("feth{FETH_IO_UNIT}")) {
+    if let Ok(old) = Feth::from_existing(&io_name) {
         let _ = old.destroy();
     }
-    if let Ok(old) = Feth::from_existing(format!("feth{FETH_IP_UNIT}")) {
+    if let Ok(old) = Feth::from_existing(&ip_name) {
         let _ = old.destroy();
     }
 
-    tracing::info!(
-        io = format_args!("feth{FETH_IO_UNIT}"),
-        ip = format_args!("feth{FETH_IP_UNIT}"),
-        "creating feth pair",
-    );
+    tracing::info!(io = %io_name, ip = %ip_name, "creating feth pair");
 
-    // Create both interfaces first, then set peer relationship.
-    let feth_io = Feth::create(FETH_IO_UNIT)?;
-    let feth_ip = Feth::create(FETH_IP_UNIT)?;
+    let feth_io = Feth::create(iface.io_unit)?;
+    let feth_ip = Feth::create(iface.ip_unit)?;
 
     feth_io.set_peer(feth_ip.name())?;
 
-    // Configure I/O side (no IP — raw frames only).
-    feth_io.set_mtu(MTU)?;
+    // I/O side: no IP — raw frames only.
+    feth_io.set_mtu(iface.mtu)?;
     feth_io.up()?;
 
-    // Configure IP side.
-    feth_ip.set_inet(INNER_ADDR, INNER_PREFIX)?;
-    feth_ip.set_mtu(MTU)?;
+    // IP side.
+    let (addr, prefix) = iface
+        .parse_address()
+        .map_err(|e| feth_rs::feth::Error::InvalidName(e.to_string()))?;
+    feth_ip.set_inet(addr, prefix)?;
+    feth_ip.set_mtu(iface.mtu)?;
     feth_ip.up()?;
 
     tracing::info!(
-        ip_iface = feth_ip.name(),
-        addr = format_args!("{INNER_ADDR}/{INNER_PREFIX}"),
-        mtu = MTU,
+        ip_iface = %ip_name,
+        addr = %iface.address,
+        mtu = iface.mtu,
         "feth pair ready",
     );
 
     Ok((feth_io, feth_ip))
 }
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+async fn cmd_server_up(config_path: PathBuf) -> std::io::Result<()> {
+    let config = config::Config::from_file(&config_path)?;
+    tracing::info!(path = %config_path.display(), "loaded config");
 
-    let (feth_io, feth_ip) = setup_interfaces().map_err(|e| std::io::Error::other(e))?;
+    let (feth_io, feth_ip) =
+        setup_interfaces(&config.interface).map_err(std::io::Error::other)?;
 
-    let config = VxlanServerConfig {
-        listen_addr: SocketAddr::from(([0, 0, 0, 0], protocol::IANA_VXLAN_UDP_PORT)),
-        vni: 100,
-        feth_ifname: "feth101".to_owned(),
-        remote_vtep: SocketAddr::from(([192, 168, 50, 212], protocol::IANA_VXLAN_UDP_PORT)),
-    };
-
-    let server = server::VxlanServer::bind(config).await?;
+    let server = server::VxlanServer::bind(&config).await?;
 
     let result = tokio::select! {
         result = server.run() => result,
@@ -86,4 +96,22 @@ async fn main() -> std::io::Result<()> {
     let _ = feth_ip.destroy();
 
     result
+}
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let cli = Cli::parse();
+
+    match cli.command {
+        Command::Server { action } => match action {
+            ServerAction::Up { config } => cmd_server_up(config).await,
+        },
+    }
 }
