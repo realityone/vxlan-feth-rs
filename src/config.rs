@@ -64,6 +64,23 @@ impl Config {
     }
 }
 
+impl InterfaceConfig {
+    /// Compute the number of host addresses in the IP-side CIDR subnet.
+    /// E.g. /24 → 254, /16 → 65534.  Returns 254 as fallback.
+    pub fn subnet_host_count(&self) -> usize {
+        let prefix_len = self
+            .ip
+            .parse_address()
+            .map(|(_, p)| p)
+            .unwrap_or(24);
+        if prefix_len >= 31 {
+            return 2usize.saturating_pow(32 - prefix_len as u32);
+        }
+        // 2^(32 - prefix) - 2  (exclude network + broadcast)
+        (1usize << (32 - prefix_len)) - 2
+    }
+}
+
 impl FethSideConfig {
     pub fn name(&self) -> String {
         format!("feth{}", self.unit)
