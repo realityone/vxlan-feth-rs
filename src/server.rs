@@ -105,13 +105,37 @@ impl VxlanServer {
         })
     }
 
+    /// Send a raw Ethernet frame to all BUM peers via VXLAN encapsulation.
+    pub async fn flood_frame(&self, frame: &[u8]) {
+        let vxlan_hdr = VxlanHdr::new(self.vni);
+        let hdr_bytes = vxlan_hdr.as_bytes();
+        self.socket.writable().await.ok();
+
+        for &remote in &self.fdb.bum {
+            let result = self.socket.try_io(Interest::WRITABLE, || {
+                sendmsg_udp(self.socket.as_raw_fd(), &[hdr_bytes, frame], remote)
+            });
+            if let Err(e) = result {
+                tracing::warn!(remote = %remote, error = %e, "failed to flood frame");
+            }
+        }
+    }
+
     /// Run the server, forwarding packets in both directions until cancelled.
+    ///
+    /// The `on_ready` callback is invoked with a reference to the server after
+    /// binding but before entering the main loop, giving the caller a chance to
+    /// send initial packets (e.g. gratuitous ARP).
     ///
     /// After each readiness notification, drains all available packets before
     /// re-entering the event loop to reduce epoll overhead.
-    pub async fn run(mut self) -> io::Result<()> {
-        let vxlan_hdr = VxlanHdr::new(self.vni);
+    pub async fn run<F>(mut self, on_ready: F) -> io::Result<()>
+    where
+        F: for<'a> FnOnce(&'a Self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>,
+    {
+        on_ready(&self).await;
 
+        let vxlan_hdr = VxlanHdr::new(self.vni);
         let mut udp_buf = vec![0u8; MAX_RECV_BUF];
         let mut feth_buf = vec![0u8; MAX_RECV_BUF];
 

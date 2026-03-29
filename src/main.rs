@@ -2,7 +2,7 @@ pub mod config;
 pub mod protocol;
 pub mod server;
 
-use std::path::PathBuf;
+use std::{net::Ipv4Addr, path::PathBuf};
 
 use clap::{Parser, Subcommand};
 use feth_rs::feth::{Feth, MacAddr};
@@ -32,8 +32,18 @@ enum ServerAction {
     },
 }
 
+/// Result of setting up the feth interface pair.
+struct InterfaceSetup {
+    feth_io: Feth,
+    feth_ip: Feth,
+    /// MAC address assigned to the IP-side interface.
+    ip_mac: MacAddr,
+    /// Overlay IPv4 address.
+    ip_addr: Ipv4Addr,
+}
+
 /// Create and configure the feth pair from config.
-fn setup_interfaces(iface: &config::InterfaceConfig) -> Result<(Feth, Feth), feth_rs::feth::Error> {
+fn setup_interfaces(iface: &config::InterfaceConfig) -> Result<InterfaceSetup, feth_rs::feth::Error> {
     let io_cfg = &iface.io;
     let ip_cfg = &iface.ip;
     let io_name = io_cfg.name();
@@ -68,6 +78,9 @@ fn setup_interfaces(iface: &config::InterfaceConfig) -> Result<(Feth, Feth), fet
     let (addr, prefix) = ip_cfg
         .parse_address()
         .map_err(|e| feth_rs::feth::Error::InvalidName(e.to_string()))?;
+    let ip_addr: Ipv4Addr = addr
+        .parse()
+        .map_err(|e: std::net::AddrParseError| feth_rs::feth::Error::InvalidName(e.to_string()))?;
     feth_ip.set_inet(addr, prefix)?;
     feth_ip.set_mtu(ip_cfg.mtu)?;
     feth_ip.up()?;
@@ -80,20 +93,30 @@ fn setup_interfaces(iface: &config::InterfaceConfig) -> Result<(Feth, Feth), fet
         "feth pair ready",
     );
 
-    Ok((feth_io, feth_ip))
+    Ok(InterfaceSetup {
+        feth_io,
+        feth_ip,
+        ip_mac,
+        ip_addr,
+    })
 }
 
 async fn cmd_server_up(config_path: PathBuf) -> std::io::Result<()> {
     let config = config::Config::from_file(&config_path)?;
     tracing::info!(path = %config_path.display(), "loaded config");
 
-    let (feth_io, feth_ip) =
+    let iface_setup =
         setup_interfaces(&config.interface).map_err(std::io::Error::other)?;
+
+    let garp = protocol::ArpFrame::gratuitous(&iface_setup.ip_mac.0, iface_setup.ip_addr);
 
     let server = server::VxlanServer::bind(&config).await?;
 
     let result = tokio::select! {
-        result = server.run() => result,
+        result = server.run(|srv| Box::pin(async move {
+            tracing::info!("sending gratuitous ARP to BUM peers");
+            srv.flood_frame(garp.as_bytes()).await;
+        })) => result,
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutting down");
             Ok(())
@@ -101,8 +124,8 @@ async fn cmd_server_up(config_path: PathBuf) -> std::io::Result<()> {
     };
 
     tracing::info!("tearing down feth interfaces");
-    let _ = feth_io.destroy();
-    let _ = feth_ip.destroy();
+    let _ = iface_setup.feth_io.destroy();
+    let _ = iface_setup.feth_ip.destroy();
 
     result
 }

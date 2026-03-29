@@ -720,6 +720,143 @@ impl<'a> VxlanPacket<'a> {
     }
 }
 
+// ── ARP ─────────────────────────────────────────────────────────────────────
+
+pub const ARP_HW_ETHERNET: u16 = 1;
+pub const ARP_OP_REQUEST: u16 = 1;
+pub const ARP_OP_REPLY: u16 = 2;
+pub const BROADCAST_MAC: [u8; 6] = [0xff; 6];
+
+/// ARP packet for Ethernet/IPv4 (28 bytes).
+///
+/// ```text
+///  0                   1                   2                   3
+///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |        Hardware Type          |         Protocol Type         |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |  HW Len | Proto Len |           Operation           |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                    Sender Hardware Address                    |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |  Sender HW (cont) |         Sender Protocol Address          |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |  Sender Proto (c)  |       Target Hardware Address           |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                Target HW (cont)       |  Target Proto Addr   |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |  Target Proto (cont)  |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+
+/// ```
+#[repr(C)]
+pub struct ArpPacket {
+    pub hw_type: [u8; 2],
+    pub proto_type: [u8; 2],
+    pub hw_len: u8,
+    pub proto_len: u8,
+    pub operation: [u8; 2],
+    pub sender_mac: [u8; 6],
+    pub sender_ip: [u8; 4],
+    pub target_mac: [u8; 6],
+    pub target_ip: [u8; 4],
+}
+
+const _: () = assert!(size_of::<ArpPacket>() == 28);
+
+impl ArpPacket {
+    pub fn from_bytes(buf: &[u8]) -> Result<(&Self, &[u8]), ParseError> {
+        // Safety: all fields are u8 or [u8; N], alignment is 1.
+        unsafe { cast_ref_with_payload(buf) }
+    }
+
+    pub fn hw_type(&self) -> u16 {
+        u16::from_be_bytes(self.hw_type)
+    }
+
+    pub fn proto_type(&self) -> u16 {
+        u16::from_be_bytes(self.proto_type)
+    }
+
+    pub fn operation(&self) -> u16 {
+        u16::from_be_bytes(self.operation)
+    }
+
+    pub fn sender_ip(&self) -> Ipv4Addr {
+        Ipv4Addr::from(self.sender_ip)
+    }
+
+    pub fn target_ip(&self) -> Ipv4Addr {
+        Ipv4Addr::from(self.target_ip)
+    }
+}
+
+impl fmt::Debug for ArpPacket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let fmt_mac = |m: &[u8; 6]| {
+            format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                m[0], m[1], m[2], m[3], m[4], m[5]
+            )
+        };
+        f.debug_struct("ArpPacket")
+            .field("operation", &self.operation())
+            .field("sender_mac", &fmt_mac(&self.sender_mac))
+            .field("sender_ip", &self.sender_ip())
+            .field("target_mac", &fmt_mac(&self.target_mac))
+            .field("target_ip", &self.target_ip())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Combined Ethernet + ARP frame (42 bytes), for zero-copy construction
+/// and parsing.
+#[repr(C)]
+pub struct ArpFrame {
+    pub eth: EthernetHeader,
+    pub arp: ArpPacket,
+}
+
+const _: () = assert!(size_of::<ArpFrame>() == 42);
+
+impl ArpFrame {
+    /// Parse an ARP frame from a byte slice.
+    pub fn from_bytes(buf: &[u8]) -> Result<&Self, ParseError> {
+        // Safety: all fields are u8 or [u8; N], alignment is 1.
+        unsafe { cast_ref(buf) }
+    }
+
+    /// View the frame as a raw byte slice, suitable for sending on the wire.
+    pub fn as_bytes(&self) -> &[u8; size_of::<Self>()] {
+        // Safety: #[repr(C)] with alignment 1, no padding.
+        unsafe { &*std::ptr::from_ref(self).cast::<[u8; size_of::<Self>()]>() }
+    }
+
+    /// Build a gratuitous ARP reply frame.
+    ///
+    /// A gratuitous ARP announces a MAC→IP binding to all hosts on the L2
+    /// segment, causing them to update their ARP caches immediately.
+    pub fn gratuitous(sender_mac: &[u8; 6], sender_ip: Ipv4Addr) -> Self {
+        Self {
+            eth: EthernetHeader {
+                dst_mac: BROADCAST_MAC,
+                src_mac: *sender_mac,
+                ether_type: ETHERTYPE_ARP.to_be_bytes(),
+            },
+            arp: ArpPacket {
+                hw_type: ARP_HW_ETHERNET.to_be_bytes(),
+                proto_type: ETHERTYPE_IPV4.to_be_bytes(),
+                hw_len: 6,
+                proto_len: 4,
+                operation: ARP_OP_REPLY.to_be_bytes(),
+                sender_mac: *sender_mac,
+                sender_ip: sender_ip.octets(),
+                target_mac: BROADCAST_MAC,
+                target_ip: sender_ip.octets(),
+            },
+        }
+    }
+}
+
 // ── Convenience constant ────────────────────────────────────────────────────
 
 pub const ETH_HEADER_LEN: usize = size_of::<EthernetHeader>();
@@ -863,5 +1000,30 @@ mod tests {
         assert_eq!(parsed.inner_eth.src_mac, [0xbb; 6]);
         assert_eq!(parsed.inner_eth.ethertype(), ETHERTYPE_IPV4);
         assert_eq!(parsed.inner_payload, &[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn test_arp_frame_roundtrip() {
+        let mac = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+        let ip = Ipv4Addr::new(10, 0, 0, 2);
+
+        let frame = ArpFrame::gratuitous(&mac, ip);
+        let bytes = frame.as_bytes();
+        assert_eq!(bytes.len(), 42);
+
+        // Parse it back.
+        let parsed = ArpFrame::from_bytes(bytes).unwrap();
+        assert_eq!(parsed.eth.dst_mac, BROADCAST_MAC);
+        assert_eq!(parsed.eth.src_mac, mac);
+        assert_eq!(parsed.eth.ethertype(), ETHERTYPE_ARP);
+        assert_eq!(parsed.arp.hw_type(), ARP_HW_ETHERNET);
+        assert_eq!(parsed.arp.proto_type(), ETHERTYPE_IPV4);
+        assert_eq!(parsed.arp.hw_len, 6);
+        assert_eq!(parsed.arp.proto_len, 4);
+        assert_eq!(parsed.arp.operation(), ARP_OP_REPLY);
+        assert_eq!(parsed.arp.sender_mac, mac);
+        assert_eq!(parsed.arp.sender_ip(), ip);
+        assert_eq!(parsed.arp.target_mac, BROADCAST_MAC);
+        assert_eq!(parsed.arp.target_ip(), ip);
     }
 }
