@@ -1,4 +1,11 @@
-use std::{collections::HashMap, io, net::SocketAddr, os::fd::AsRawFd};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    io,
+    net::SocketAddr,
+    os::fd::AsRawFd,
+    time::Instant,
+};
 
 use tokio::{io::Interest, net::UdpSocket};
 
@@ -15,6 +22,9 @@ const SO_RCVBUF_SIZE: libc::c_int = 4 * 1024 * 1024;
 /// Socket send buffer size (4 MiB).
 const SO_SNDBUF_SIZE: libc::c_int = 4 * 1024 * 1024;
 
+/// Learned MAC entries expire after this duration.
+const LEARNED_MAC_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Forwarding database: maps destination MAC to remote VTEP(s).
 ///
 /// - Unicast entries (`mac != 00:00:00:00:00:00`) map to a single VTEP.
@@ -26,10 +36,16 @@ struct Fdb {
     unicast: HashMap<[u8; 6], SocketAddr>,
     /// Flood list for broadcast / unknown-unicast / multicast.
     bum: Vec<SocketAddr>,
+    /// Source MAC → (remote VTEP IP, last seen time) learned from incoming
+    /// VXLAN packets.  Used for split-horizon: don't flood a frame back to
+    /// the VTEP that originated it.  Entries expire after `LEARNED_MAC_TTL`.
+    learned: RefCell<HashMap<[u8; 6], (std::net::IpAddr, Instant)>>,
+    /// Maximum number of learned MAC entries.
+    max_learned: usize,
 }
 
 impl Fdb {
-    fn from_entries(entries: &[FdbEntry]) -> Self {
+    fn new(entries: &[FdbEntry], max_learned: usize) -> Self {
         let mut unicast = HashMap::new();
         let mut bum = Vec::new();
         for entry in entries {
@@ -39,7 +55,42 @@ impl Fdb {
                 unicast.insert(entry.mac, entry.dst);
             }
         }
-        Self { unicast, bum }
+        Self {
+            unicast,
+            bum,
+            learned: RefCell::new(HashMap::new()),
+            max_learned,
+        }
+    }
+
+    /// Record the source MAC → remote VTEP IP from an incoming frame.
+    fn learn(&self, src_mac: [u8; 6], peer: SocketAddr) {
+        let mut table = self.learned.borrow_mut();
+        if table.len() >= self.max_learned && !table.contains_key(&src_mac) {
+            // Table full — drop the new entry rather than evicting.
+            return;
+        }
+        table.insert(src_mac, (peer.ip(), Instant::now()));
+    }
+
+    /// Evict all expired entries.  Called periodically from the event loop.
+    fn gc_learned(&self) {
+        let mut table = self.learned.borrow_mut();
+        let before = table.len();
+        table.retain(|_, (_, ts)| ts.elapsed() < LEARNED_MAC_TTL);
+        let evicted = before - table.len();
+        if evicted > 0 {
+            tracing::debug!(evicted, remaining = table.len(), "learned MAC GC");
+        }
+    }
+
+    /// Return the VTEP IP a source MAC was learned from, if not expired.
+    fn learned_peer_ip(&self, src_mac: &[u8; 6]) -> Option<std::net::IpAddr> {
+        let table = self.learned.borrow();
+        match table.get(src_mac) {
+            Some(&(ip, ts)) if ts.elapsed() < LEARNED_MAC_TTL => Some(ip),
+            _ => None,
+        }
     }
 
     /// Look up destinations for a given destination MAC.
@@ -85,7 +136,8 @@ impl VxlanServer {
         let socket = UdpSocket::bind(config.server.listen).await?;
         set_sock_buf_size(socket.as_raw_fd())?;
 
-        let fdb = Fdb::from_entries(&config.fdb);
+        let max_learned = config.interface.subnet_host_count();
+        let fdb = Fdb::new(&config.fdb, max_learned);
 
         tracing::info!(
             listen = %config.server.listen,
@@ -93,6 +145,7 @@ impl VxlanServer {
             feth = %config.interface.io.name(),
             bum_peers = fdb.bum.len(),
             unicast_entries = fdb.unicast.len(),
+            max_learned,
             "vxlan server bound",
         );
 
@@ -138,6 +191,7 @@ impl VxlanServer {
         let vxlan_hdr = VxlanHdr::new(self.vni);
         let mut udp_buf = vec![0u8; MAX_RECV_BUF];
         let mut feth_buf = vec![0u8; MAX_RECV_BUF];
+        let mut gc_interval = tokio::time::interval(LEARNED_MAC_TTL / 2);
 
         loop {
             tokio::select! {
@@ -159,12 +213,18 @@ impl VxlanServer {
                     let n = result?;
                     self.handle_tx(&vxlan_hdr, &feth_buf[..n]).await;
                 }
+
+                // Periodic GC of expired learned MAC entries.
+                _ = gc_interval.tick() => {
+                    self.fdb.gc_learned();
+                }
             }
         }
     }
 
-    /// Handle an incoming UDP datagram: parse VXLAN, validate VNI, inject inner frame.
-    fn handle_rx(&self, data: &[u8], _: SocketAddr) {
+    /// Handle an incoming UDP datagram: parse VXLAN, validate VNI, learn source
+    /// MAC for split-horizon, inject inner frame.
+    fn handle_rx(&self, data: &[u8], peer: SocketAddr) {
         let (vxlan, inner_frame) = match VxlanHdr::from_bytes(data) {
             Ok(parsed) => parsed,
             Err(_) => return,
@@ -178,6 +238,11 @@ impl VxlanServer {
             return;
         }
 
+        // Learn source MAC → remote VTEP for split-horizon filtering.
+        if let Ok((eth, _)) = EthernetHeader::from_bytes(inner_frame) {
+            self.fdb.learn(eth.src_mac, peer);
+        }
+
         if let Err(e) = self.feth_io.send(inner_frame) {
             tracing::warn!(error = %e, "failed to inject frame into feth");
         }
@@ -187,13 +252,16 @@ impl VxlanServer {
     ///
     /// Uses `sendmsg` with `iovec` to scatter-gather the VXLAN header and
     /// inner frame, avoiding a copy into a contiguous buffer.
+    ///
+    /// Split-horizon: if the frame's source MAC was learned from a remote VTEP,
+    /// that VTEP is excluded from the flood list to prevent loops.
     async fn handle_tx(&self, vxlan_hdr: &VxlanHdr, frame: &[u8]) {
         if frame.len() < protocol::ETH_HEADER_LEN {
             return;
         }
 
-        let dst_mac = match EthernetHeader::from_bytes(frame) {
-            Ok((eth, _)) => eth.dst_mac,
+        let (dst_mac, src_mac) = match EthernetHeader::from_bytes(frame) {
+            Ok((eth, _)) => (eth.dst_mac, eth.src_mac),
             Err(_) => return,
         };
 
@@ -202,10 +270,17 @@ impl VxlanServer {
             return;
         }
 
+        // Split-horizon: skip the VTEP this source MAC was learned from.
+        let exclude_ip = self.fdb.learned_peer_ip(&src_mac);
+
         let hdr_bytes = vxlan_hdr.as_bytes();
         self.socket.writable().await.ok();
 
         for &remote in destinations {
+            if exclude_ip == Some(remote.ip()) {
+                continue;
+            }
+
             let result = self.socket.try_io(Interest::WRITABLE, || {
                 sendmsg_udp(self.socket.as_raw_fd(), &[hdr_bytes, frame], remote)
             });
