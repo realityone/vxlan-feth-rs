@@ -66,11 +66,26 @@ impl Fdb {
     /// Record the source MAC → remote VTEP IP from an incoming frame.
     fn learn(&self, src_mac: [u8; 6], peer: SocketAddr) {
         let mut table = self.learned.borrow_mut();
-        if table.len() >= self.max_learned && !table.contains_key(&src_mac) {
-            // Table full — drop the new entry rather than evicting.
+        let is_new = !table.contains_key(&src_mac);
+        if table.len() >= self.max_learned && is_new {
+            tracing::trace!(
+                mac = %config::format_mac(&src_mac),
+                peer = %peer,
+                table_size = table.len(),
+                max = self.max_learned,
+                "learned table full, dropping new entry",
+            );
             return;
         }
         table.insert(src_mac, (peer.ip(), Instant::now()));
+        if is_new {
+            tracing::trace!(
+                mac = %config::format_mac(&src_mac),
+                peer_ip = %peer.ip(),
+                table_size = table.len(),
+                "learned new MAC",
+            );
+        }
     }
 
     /// Evict all expired entries.  Called periodically from the event loop.
@@ -89,6 +104,15 @@ impl Fdb {
         let table = self.learned.borrow();
         match table.get(src_mac) {
             Some(&(ip, ts)) if ts.elapsed() < LEARNED_MAC_TTL => Some(ip),
+            Some(&(ip, ts)) => {
+                tracing::trace!(
+                    mac = %config::format_mac(src_mac),
+                    peer_ip = %ip,
+                    age_secs = ts.elapsed().as_secs(),
+                    "learned entry expired",
+                );
+                None
+            }
             _ => None,
         }
     }
@@ -278,6 +302,12 @@ impl VxlanServer {
 
         for &remote in destinations {
             if exclude_ip == Some(remote.ip()) {
+                tracing::trace!(
+                    src = %config::format_mac(&src_mac),
+                    dst = %config::format_mac(&dst_mac),
+                    remote = %remote,
+                    "split-horizon: skipping originating VTEP",
+                );
                 continue;
             }
 
