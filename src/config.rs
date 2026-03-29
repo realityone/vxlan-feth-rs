@@ -18,6 +18,9 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     /// 24-bit VXLAN Network Identifier.
     pub vni: u32,
+    /// Inspect API unix socket path (e.g. "/tmp/vxlan-feth.sock").
+    /// Defaults to "/tmp/vxlan-feth.sock".
+    pub api: Option<String>,
 }
 
 /// feth interface pair settings.
@@ -68,13 +71,9 @@ impl InterfaceConfig {
     /// Compute the number of host addresses in the IP-side CIDR subnet.
     /// E.g. /24 → 254, /16 → 65534.  Returns 254 as fallback.
     pub fn subnet_host_count(&self) -> usize {
-        let prefix_len = self
-            .ip
-            .parse_address()
-            .map(|(_, p)| p)
-            .unwrap_or(24);
+        let prefix_len = self.ip.parse_address().map(|(_, p)| p).unwrap_or(24);
         if prefix_len >= 31 {
-            return 2usize.saturating_pow(32 - prefix_len as u32);
+            return 2usize.saturating_pow(32 - u32::from(prefix_len));
         }
         // 2^(32 - prefix) - 2  (exclude network + broadcast)
         (1usize << (32 - prefix_len)) - 2
@@ -86,11 +85,12 @@ impl FethSideConfig {
         format!("feth{}", self.unit)
     }
 
-    /// Parse `address` field into (ip_str, prefix_len).
+    /// Parse `address` field into (`ip_str`, `prefix_len`).
     pub fn parse_address(&self) -> io::Result<(&str, u8)> {
-        let addr = self.address.as_deref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "address is required")
-        })?;
+        let addr = self
+            .address
+            .as_deref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "address is required"))?;
         let (ip, prefix) = addr.split_once('/').ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,

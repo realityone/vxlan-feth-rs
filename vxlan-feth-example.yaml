@@ -1,6 +1,7 @@
 server:
   listen: "0.0.0.0:4789"
   vni: 100
+  # api: "/tmp/vxlan-feth.sock"  # Optional; inspect API unix socket path (default: /tmp/vxlan-feth.sock)
 
 interface:
   io:
@@ -17,6 +18,8 @@ fdb:
   # BUM entry — flood broadcast/unknown-unicast/multicast to these VTEPs
   - mac: "00:00:00:00:00:00"
     dst: "192.168.50.81:4789"
+  - mac: "00:00:00:00:00:00"
+    dst: "192.168.50.212:4789"
 
   # Static unicast entries — known MAC-to-VTEP mappings
   # - mac: "46:69:54:77:86:17"

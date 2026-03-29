@@ -541,7 +541,6 @@ impl VxlanHdr {
     pub unsafe fn as_gbp(&self) -> &VxlanHdrGbp {
         unsafe { &*std::ptr::from_ref(self).cast::<VxlanHdrGbp>() }
     }
-
 }
 
 impl fmt::Debug for VxlanHdr {

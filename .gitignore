@@ -27,3 +27,6 @@ target
 
 # Reference kernel source
 /vxlan/
+
+# Config file
+vxlan-feth.yaml

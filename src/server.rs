@@ -1,10 +1,12 @@
 use std::{
-    cell::RefCell,
     collections::HashMap,
     io,
     net::SocketAddr,
     os::fd::AsRawFd,
-    sync::atomic::{AtomicU64, Ordering::Relaxed},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
     time::Instant,
 };
 
@@ -17,103 +19,26 @@ use crate::{
 
 /// Tunnel traffic statistics, similar to `ip -s link show` on Linux.
 #[derive(Debug, Default)]
-struct TunnelStats {
+pub struct TunnelStats {
     /// RX: packets received from remote VTEPs (UDP → feth).
-    rx_packets: AtomicU64,
+    pub rx_packets: AtomicU64,
     /// RX: bytes received (inner frame bytes, excluding VXLAN header).
-    rx_bytes: AtomicU64,
+    pub rx_bytes: AtomicU64,
     /// RX: packets dropped (invalid VXLAN header, wrong VNI, too short).
-    rx_drops: AtomicU64,
+    pub rx_drops: AtomicU64,
     /// RX: packets with invalid VXLAN header.
-    rx_invalid: AtomicU64,
+    pub rx_invalid: AtomicU64,
 
     /// TX: packets sent to remote VTEPs (feth → UDP).
-    tx_packets: AtomicU64,
+    pub tx_packets: AtomicU64,
     /// TX: bytes sent (inner frame bytes, excluding VXLAN header).
-    tx_bytes: AtomicU64,
+    pub tx_bytes: AtomicU64,
     /// TX: send errors.
-    tx_errors: AtomicU64,
+    pub tx_errors: AtomicU64,
     /// TX: packets suppressed by split-horizon.
-    tx_split_horizon: AtomicU64,
+    pub tx_split_horizon: AtomicU64,
     /// TX: packets dropped due to empty FDB lookup.
-    tx_no_route: AtomicU64,
-}
-
-/// Snapshot of counters for computing deltas between reporting intervals.
-#[derive(Debug, Default)]
-struct StatsSnapshot {
-    rx_packets: u64,
-    rx_bytes: u64,
-    rx_drops: u64,
-    rx_invalid: u64,
-    tx_packets: u64,
-    tx_bytes: u64,
-    tx_errors: u64,
-    tx_split_horizon: u64,
-    tx_no_route: u64,
-}
-
-/// Split-horizon suppressions per second above this threshold trigger a
-/// flood-loop warning.
-const FLOOD_LOOP_WARN_PPS: u64 = 100;
-
-impl TunnelStats {
-    fn snapshot(&self) -> StatsSnapshot {
-        StatsSnapshot {
-            rx_packets: self.rx_packets.load(Relaxed),
-            rx_bytes: self.rx_bytes.load(Relaxed),
-            rx_drops: self.rx_drops.load(Relaxed),
-            rx_invalid: self.rx_invalid.load(Relaxed),
-            tx_packets: self.tx_packets.load(Relaxed),
-            tx_bytes: self.tx_bytes.load(Relaxed),
-            tx_errors: self.tx_errors.load(Relaxed),
-            tx_split_horizon: self.tx_split_horizon.load(Relaxed),
-            tx_no_route: self.tx_no_route.load(Relaxed),
-        }
-    }
-
-    fn log_summary(&self, prev: &StatsSnapshot, elapsed_secs: u64) -> StatsSnapshot {
-        let curr = self.snapshot();
-        let secs = elapsed_secs.max(1);
-
-        let d_rx_pkts = curr.rx_packets - prev.rx_packets;
-        let d_rx_bytes = curr.rx_bytes - prev.rx_bytes;
-        let d_rx_drops = curr.rx_drops - prev.rx_drops;
-        let d_rx_invalid = curr.rx_invalid - prev.rx_invalid;
-        let d_tx_pkts = curr.tx_packets - prev.tx_packets;
-        let d_tx_bytes = curr.tx_bytes - prev.tx_bytes;
-        let d_tx_errors = curr.tx_errors - prev.tx_errors;
-        let d_tx_sh = curr.tx_split_horizon - prev.tx_split_horizon;
-        let d_tx_no_route = curr.tx_no_route - prev.tx_no_route;
-
-        tracing::info!(
-            rx_pps = d_rx_pkts / secs,
-            rx_bps = d_rx_bytes / secs,
-            rx_drops = d_rx_drops,
-            rx_invalid = d_rx_invalid,
-            tx_pps = d_tx_pkts / secs,
-            tx_bps = d_tx_bytes / secs,
-            tx_errors = d_tx_errors,
-            tx_split_horizon = d_tx_sh,
-            tx_no_route = d_tx_no_route,
-            total_rx = curr.rx_packets,
-            total_tx = curr.tx_packets,
-            "tunnel stats",
-        );
-
-        // Flood-loop detection: high split-horizon suppression rate means a
-        // remote VTEP is likely re-flooding frames without split-horizon.
-        let sh_pps = d_tx_sh / secs;
-        if sh_pps > FLOOD_LOOP_WARN_PPS {
-            tracing::warn!(
-                split_horizon_pps = sh_pps,
-                "possible flood loop: high split-horizon suppression rate, \
-                 check that all VTEP peers have split-horizon enabled",
-            );
-        }
-
-        curr
-    }
+    pub tx_no_route: AtomicU64,
 }
 
 /// Maximum UDP datagram size: full 16-bit UDP length field.
@@ -132,24 +57,21 @@ const SO_SNDBUF_SIZE: libc::c_int = 4 * 1024 * 1024;
 /// Learned MAC entries expire after this duration.
 const LEARNED_MAC_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Interval between stats log lines.
-const STATS_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
 /// Forwarding database: maps destination MAC to remote VTEP(s).
 ///
 /// - Unicast entries (`mac != 00:00:00:00:00:00`) map to a single VTEP.
 /// - BUM entries (`mac == 00:00:00:00:00:00`) are collected into a flood list;
 ///   frames with no unicast match are sent to all BUM destinations.
 #[derive(Debug)]
-struct Fdb {
+pub struct Fdb {
     /// Exact MAC → VTEP mapping.
-    unicast: HashMap<[u8; 6], SocketAddr>,
+    pub unicast: HashMap<[u8; 6], SocketAddr>,
     /// Flood list for broadcast / unknown-unicast / multicast.
-    bum: Vec<SocketAddr>,
+    pub bum: Vec<SocketAddr>,
     /// Source MAC → (remote VTEP IP, last seen time) learned from incoming
     /// VXLAN packets.  Used for split-horizon: don't flood a frame back to
     /// the VTEP that originated it.  Entries expire after `LEARNED_MAC_TTL`.
-    learned: RefCell<HashMap<[u8; 6], (std::net::IpAddr, Instant)>>,
+    pub learned: RwLock<HashMap<[u8; 6], (std::net::IpAddr, Instant)>>,
     /// Maximum number of learned MAC entries.
     max_learned: usize,
 }
@@ -168,14 +90,14 @@ impl Fdb {
         Self {
             unicast,
             bum,
-            learned: RefCell::new(HashMap::new()),
+            learned: RwLock::new(HashMap::new()),
             max_learned,
         }
     }
 
     /// Record the source MAC → remote VTEP IP from an incoming frame.
     fn learn(&self, src_mac: [u8; 6], peer: SocketAddr) {
-        let mut table = self.learned.borrow_mut();
+        let mut table = self.learned.write().unwrap();
         let is_new = !table.contains_key(&src_mac);
         if table.len() >= self.max_learned && is_new {
             tracing::trace!(
@@ -200,7 +122,7 @@ impl Fdb {
 
     /// Evict all expired entries.  Called periodically from the event loop.
     fn gc_learned(&self) {
-        let mut table = self.learned.borrow_mut();
+        let mut table = self.learned.write().unwrap();
         let before = table.len();
         table.retain(|_, (_, ts)| ts.elapsed() < LEARNED_MAC_TTL);
         let evicted = before - table.len();
@@ -210,13 +132,13 @@ impl Fdb {
     }
 
     /// Return the VTEP IP a source MAC was learned from, if not expired.
-    fn learned_peer_ip(&self, src_mac: &[u8; 6]) -> Option<std::net::IpAddr> {
-        let table = self.learned.borrow();
-        match table.get(src_mac) {
+    fn learned_peer_ip(&self, src_mac: [u8; 6]) -> Option<std::net::IpAddr> {
+        let table = self.learned.read().unwrap();
+        match table.get(&src_mac) {
             Some(&(ip, ts)) if ts.elapsed() < LEARNED_MAC_TTL => Some(ip),
             Some(&(ip, ts)) => {
                 tracing::trace!(
-                    mac = %config::format_mac(src_mac),
+                    mac = %config::format_mac(&src_mac),
                     peer_ip = %ip,
                     age_secs = ts.elapsed().as_secs(),
                     "learned entry expired",
@@ -231,13 +153,13 @@ impl Fdb {
     ///
     /// Returns a single VTEP for known unicast, or the full BUM flood list
     /// for broadcast/multicast/unknown destinations.
-    fn lookup(&self, dst_mac: &[u8; 6]) -> &[SocketAddr] {
+    fn lookup(&self, dst_mac: [u8; 6]) -> &[SocketAddr] {
         // Broadcast / multicast — always flood.
         if dst_mac[0] & 0x01 != 0 {
             return &self.bum;
         }
         // Known unicast.
-        if let Some(addr) = self.unicast.get(dst_mac) {
+        if let Some(addr) = self.unicast.get(&dst_mac) {
             return std::slice::from_ref(addr);
         }
         // Unknown unicast — flood.
@@ -261,15 +183,15 @@ pub struct VxlanServer {
     vni: u32,
     socket: UdpSocket,
     feth_io: feth_rs::feth_tokio::AsyncFethIO,
-    fdb: Fdb,
-    stats: TunnelStats,
+    fdb: Arc<Fdb>,
+    stats: Arc<TunnelStats>,
 }
 
 impl VxlanServer {
     /// Create a new server from the parsed config.
     pub async fn bind(config: &config::Config) -> io::Result<Self> {
         let socket = UdpSocket::bind(config.server.listen).await?;
-        set_sock_buf_size(socket.as_raw_fd())?;
+        set_sock_buf_size(socket.as_raw_fd());
 
         let max_learned = config.interface.subnet_host_count();
         let fdb = Fdb::new(&config.fdb, max_learned);
@@ -289,9 +211,19 @@ impl VxlanServer {
             vni: config.server.vni,
             socket,
             feth_io,
-            fdb,
-            stats: TunnelStats::default(),
+            fdb: Arc::new(fdb),
+            stats: Arc::new(TunnelStats::default()),
         })
+    }
+
+    /// Get a shared reference to the FDB for use by the inspect API.
+    pub fn fdb(&self) -> &Arc<Fdb> {
+        &self.fdb
+    }
+
+    /// Get a shared reference to the tunnel stats for use by the inspect API.
+    pub fn stats(&self) -> &Arc<TunnelStats> {
+        &self.stats
     }
 
     /// Send a raw Ethernet frame to all BUM peers via VXLAN encapsulation.
@@ -330,9 +262,6 @@ impl VxlanServer {
         let mut udp_buf = vec![0u8; MAX_UDP_BUF];
         let mut feth_buf = vec![0u8; MAX_ETHER_BUF];
         let mut gc_interval = tokio::time::interval(LEARNED_MAC_TTL / 2);
-        let mut stats_interval = tokio::time::interval(STATS_LOG_INTERVAL);
-        let mut stats_prev = StatsSnapshot::default();
-        let mut stats_last = Instant::now();
 
         loop {
             tokio::select! {
@@ -364,13 +293,6 @@ impl VxlanServer {
                     self.fdb.gc_learned();
                 }
 
-                // Periodic stats reporting with rate computation.
-                _ = stats_interval.tick() => {
-                    let now = Instant::now();
-                    let elapsed = now.duration_since(stats_last).as_secs();
-                    stats_prev = self.stats.log_summary(&stats_prev, elapsed);
-                    stats_last = now;
-                }
             }
         }
     }
@@ -378,12 +300,9 @@ impl VxlanServer {
     /// Handle an incoming UDP datagram: parse VXLAN, validate VNI, learn source
     /// MAC for split-horizon, inject inner frame.
     fn handle_rx(&self, data: &[u8], peer: SocketAddr) {
-        let (vxlan, inner_frame) = match VxlanHdr::from_bytes(data) {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                self.stats.rx_invalid.fetch_add(1, Relaxed);
-                return;
-            }
+        let Ok((vxlan, inner_frame)) = VxlanHdr::from_bytes(data) else {
+            self.stats.rx_invalid.fetch_add(1, Relaxed);
+            return;
         };
 
         if vxlan.vni() != self.vni {
@@ -430,14 +349,14 @@ impl VxlanServer {
             Err(_) => return,
         };
 
-        let destinations = self.fdb.lookup(&dst_mac);
+        let destinations = self.fdb.lookup(dst_mac);
         if destinations.is_empty() {
             self.stats.tx_no_route.fetch_add(1, Relaxed);
             return;
         }
 
         // Split-horizon: skip the VTEP this source MAC was learned from.
-        let exclude_ip = self.fdb.learned_peer_ip(&src_mac);
+        let exclude_ip = self.fdb.learned_peer_ip(src_mac);
 
         let hdr_bytes = vxlan_hdr.as_bytes();
         self.socket.writable().await.ok();
@@ -528,7 +447,7 @@ fn sendmsg_udp(fd: std::os::fd::RawFd, slices: &[&[u8]; 2], dest: SocketAddr) ->
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_name = std::ptr::addr_of_mut!(storage).cast::<libc::c_void>();
     msg.msg_namelen = addr_len;
-    msg.msg_iov = iov.as_ptr() as *mut libc::iovec;
+    msg.msg_iov = iov.as_ptr().cast_mut();
     msg.msg_iovlen = iov.len() as _;
 
     // Safety: all pointers (iov, storage) are valid stack references for the
@@ -542,7 +461,7 @@ fn sendmsg_udp(fd: std::os::fd::RawFd, slices: &[&[u8]; 2], dest: SocketAddr) ->
 }
 
 /// Enlarge the kernel socket buffers to reduce packet drops under load.
-fn set_sock_buf_size(fd: std::os::fd::RawFd) -> io::Result<()> {
+fn set_sock_buf_size(fd: std::os::fd::RawFd) {
     for (opt, size) in [
         (libc::SO_RCVBUF, SO_RCVBUF_SIZE),
         (libc::SO_SNDBUF, SO_SNDBUF_SIZE),
@@ -566,5 +485,4 @@ fn set_sock_buf_size(fd: std::os::fd::RawFd) -> io::Result<()> {
             );
         }
     }
-    Ok(())
 }

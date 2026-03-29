@@ -1,4 +1,5 @@
 pub mod config;
+pub mod inspect;
 pub mod protocol;
 pub mod server;
 
@@ -21,6 +22,14 @@ enum Command {
         #[command(subcommand)]
         action: ServerAction,
     },
+    /// Inspect the running server via the API.
+    Inspect {
+        /// Unix socket path of the inspect API server.
+        #[arg(short, long, default_value = inspect::DEFAULT_SOCK_PATH)]
+        server: PathBuf,
+        #[command(subcommand)]
+        query: InspectQuery,
+    },
 }
 
 #[derive(Subcommand)]
@@ -31,6 +40,16 @@ enum ServerAction {
         #[arg(default_value = "vxlan-feth.yaml")]
         config: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum InspectQuery {
+    /// Show forwarding database entries.
+    Fdb,
+    /// Show learned MAC addresses.
+    Learned,
+    /// Show tunnel statistics.
+    Stats,
 }
 
 /// Result of setting up the feth interface pair.
@@ -44,7 +63,9 @@ struct InterfaceSetup {
 }
 
 /// Create and configure the feth pair from config.
-fn setup_interfaces(iface: &config::InterfaceConfig) -> Result<InterfaceSetup, feth_rs::feth::Error> {
+fn setup_interfaces(
+    iface: &config::InterfaceConfig,
+) -> Result<InterfaceSetup, feth_rs::feth::Error> {
     let io_cfg = &iface.io;
     let ip_cfg = &iface.ip;
     let io_name = io_cfg.name();
@@ -106,12 +127,29 @@ async fn cmd_server_up(config_path: PathBuf) -> std::io::Result<()> {
     let config = config::Config::from_file(&config_path)?;
     tracing::info!(path = %config_path.display(), "loaded config");
 
-    let iface_setup =
-        setup_interfaces(&config.interface).map_err(std::io::Error::other)?;
+    let iface_setup = setup_interfaces(&config.interface).map_err(std::io::Error::other)?;
 
     let garp = protocol::ArpFrame::gratuitous(&iface_setup.ip_mac.0, iface_setup.ip_addr);
 
     let server = server::VxlanServer::bind(&config).await?;
+
+    // Start the inspect API.
+    let api_path = PathBuf::from(
+        config
+            .server
+            .api
+            .as_deref()
+            .unwrap_or(inspect::DEFAULT_SOCK_PATH),
+    );
+    {
+        let fdb = server.fdb().clone();
+        let stats = server.stats().clone();
+        tokio::spawn(async move {
+            if let Err(e) = inspect::serve(&api_path, fdb, stats).await {
+                tracing::error!(error = %e, "inspect API failed");
+            }
+        });
+    }
 
     let result = tokio::select! {
         result = server.run(|srv| Box::pin(async move {
@@ -131,12 +169,66 @@ async fn cmd_server_up(config_path: PathBuf) -> std::io::Result<()> {
     result
 }
 
+async fn cmd_inspect(server: PathBuf, query: InspectQuery) -> std::io::Result<()> {
+    let client = inspect::connect(&server).await?;
+
+    match query {
+        InspectQuery::Fdb => {
+            let fdb = client
+                .get_fdb(tarpc::context::current())
+                .await
+                .map_err(std::io::Error::other)?;
+            println!("BUM flood list:");
+            for entry in &fdb.bum {
+                println!("  {}", entry.dst);
+            }
+            println!("\nUnicast entries:");
+            for entry in &fdb.unicast {
+                println!("  {} -> {}", entry.mac, entry.dst);
+            }
+        }
+        InspectQuery::Learned => {
+            let learned = client
+                .get_learned(tarpc::context::current())
+                .await
+                .map_err(std::io::Error::other)?;
+            if learned.is_empty() {
+                println!("No learned MAC entries.");
+            } else {
+                println!("{:<20} {:<20} Age (s)", "MAC", "Peer IP");
+                for entry in &learned {
+                    println!("{:<20} {:<20} {}", entry.mac, entry.peer_ip, entry.age_secs);
+                }
+            }
+        }
+        InspectQuery::Stats => {
+            let stats = client
+                .get_stats(tarpc::context::current())
+                .await
+                .map_err(std::io::Error::other)?;
+            println!(
+                "RX: {} packets, {} bytes, {} drops, {} invalid",
+                stats.rx_packets, stats.rx_bytes, stats.rx_drops, stats.rx_invalid
+            );
+            println!(
+                "TX: {} packets, {} bytes, {} errors",
+                stats.tx_packets, stats.tx_bytes, stats.tx_errors
+            );
+            println!(
+                "    split-horizon: {}, no-route: {}",
+                stats.tx_split_horizon, stats.tx_no_route
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,tarpc=warn")),
         )
         .init();
 
@@ -146,5 +238,6 @@ async fn main() -> std::io::Result<()> {
         Command::Server { action } => match action {
             ServerAction::Up { config } => cmd_server_up(config).await,
         },
+        Command::Inspect { server, query } => cmd_inspect(server, query).await,
     }
 }

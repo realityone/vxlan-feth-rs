@@ -20,6 +20,8 @@ libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+tarpc = { version = "0.37", features = ["tokio1", "serde-transport-json", "unix"] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
