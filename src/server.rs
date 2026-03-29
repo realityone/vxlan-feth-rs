@@ -90,13 +90,13 @@ impl VxlanServer {
         tracing::info!(
             listen = %config.server.listen,
             vni = config.server.vni,
-            feth = %config.interface.io_name(),
+            feth = %config.interface.io.name(),
             bum_peers = fdb.bum.len(),
             unicast_entries = fdb.unicast.len(),
             "vxlan server bound",
         );
 
-        let feth_io = feth_rs::feth_tokio::AsyncFethIO::open(&config.interface.io_name())?;
+        let feth_io = feth_rs::feth_tokio::AsyncFethIO::open(&config.interface.io.name())?;
         Ok(Self {
             vni: config.server.vni,
             socket,

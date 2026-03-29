@@ -5,7 +5,7 @@ pub mod server;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use feth_rs::feth::Feth;
+use feth_rs::feth::{Feth, MacAddr};
 
 #[derive(Parser)]
 #[command(name = "vxlan-feth", about = "Userspace VXLAN tunnel over feth")]
@@ -34,8 +34,10 @@ enum ServerAction {
 
 /// Create and configure the feth pair from config.
 fn setup_interfaces(iface: &config::InterfaceConfig) -> Result<(Feth, Feth), feth_rs::feth::Error> {
-    let io_name = iface.io_name();
-    let ip_name = iface.ip_name();
+    let io_cfg = &iface.io;
+    let ip_cfg = &iface.ip;
+    let io_name = io_cfg.name();
+    let ip_name = ip_cfg.name();
 
     // Clean up any leftover interfaces first.
     if let Ok(old) = Feth::from_existing(&io_name) {
@@ -47,27 +49,34 @@ fn setup_interfaces(iface: &config::InterfaceConfig) -> Result<(Feth, Feth), fet
 
     tracing::info!(io = %io_name, ip = %ip_name, "creating feth pair");
 
-    let feth_io = Feth::create(iface.io_unit)?;
-    let feth_ip = Feth::create(iface.ip_unit)?;
+    let feth_io = Feth::create(io_cfg.unit)?;
+    let feth_ip = Feth::create(ip_cfg.unit)?;
 
     feth_io.set_peer(feth_ip.name())?;
 
+    // Set MAC addresses (random if not configured).
+    let io_mac = io_cfg.mac.unwrap_or_else(MacAddr::random);
+    let ip_mac = ip_cfg.mac.unwrap_or_else(MacAddr::random);
+    feth_io.set_mac(&io_mac)?;
+    feth_ip.set_mac(&ip_mac)?;
+
     // I/O side: no IP — raw frames only.
-    feth_io.set_mtu(iface.mtu)?;
+    feth_io.set_mtu(io_cfg.mtu)?;
     feth_io.up()?;
 
     // IP side.
-    let (addr, prefix) = iface
+    let (addr, prefix) = ip_cfg
         .parse_address()
         .map_err(|e| feth_rs::feth::Error::InvalidName(e.to_string()))?;
     feth_ip.set_inet(addr, prefix)?;
-    feth_ip.set_mtu(iface.mtu)?;
+    feth_ip.set_mtu(ip_cfg.mtu)?;
     feth_ip.up()?;
 
     tracing::info!(
         ip_iface = %ip_name,
-        addr = %iface.address,
-        mtu = iface.mtu,
+        addr = %ip_cfg.address.as_deref().unwrap_or("none"),
+        io_mac = %io_mac,
+        ip_mac = %ip_mac,
         "feth pair ready",
     );
 

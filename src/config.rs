@@ -1,5 +1,6 @@
 use std::{fmt, io, net::SocketAddr, path::Path};
 
+use feth_rs::feth::MacAddr;
 use serde::Deserialize;
 
 /// Top-level configuration loaded from YAML.
@@ -22,14 +23,24 @@ pub struct ServerConfig {
 /// feth interface pair settings.
 #[derive(Debug, Clone, Deserialize)]
 pub struct InterfaceConfig {
-    /// Unit number for the I/O-side feth (e.g. 101 → feth101).
-    pub io_unit: u32,
-    /// Unit number for the IP-side feth (e.g. 100 → feth100).
-    pub ip_unit: u32,
-    /// Inner IP address with prefix length (e.g. "10.0.0.2/24").
-    pub address: String,
-    /// MTU for both interfaces.
+    /// I/O-side feth — raw frames, no IP.
+    pub io: FethSideConfig,
+    /// IP-side feth — carries the overlay address.
+    pub ip: FethSideConfig,
+}
+
+/// Per-side feth interface settings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FethSideConfig {
+    /// Unit number (e.g. 101 → feth101).
+    pub unit: u32,
+    /// IP address with prefix length (e.g. "10.0.0.2/24"). Only meaningful for the IP side.
+    pub address: Option<String>,
+    /// MTU for this interface.
     pub mtu: u32,
+    /// MAC address (e.g. "02:aa:bb:cc:dd:ee"). Random if omitted.
+    #[serde(default, deserialize_with = "deserialize_optional_mac")]
+    pub mac: Option<MacAddr>,
 }
 
 /// A forwarding database entry mapping a MAC address to a remote VTEP.
@@ -53,24 +64,20 @@ impl Config {
     }
 }
 
-impl InterfaceConfig {
-    pub fn io_name(&self) -> String {
-        format!("feth{}", self.io_unit)
-    }
-
-    pub fn ip_name(&self) -> String {
-        format!("feth{}", self.ip_unit)
+impl FethSideConfig {
+    pub fn name(&self) -> String {
+        format!("feth{}", self.unit)
     }
 
     /// Parse `address` field into (ip_str, prefix_len).
     pub fn parse_address(&self) -> io::Result<(&str, u8)> {
-        let (ip, prefix) = self.address.split_once('/').ok_or_else(|| {
+        let addr = self.address.as_deref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "address is required")
+        })?;
+        let (ip, prefix) = addr.split_once('/').ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "expected CIDR notation (e.g. 10.0.0.2/24), got: {}",
-                    self.address
-                ),
+                format!("expected CIDR notation (e.g. 10.0.0.2/24), got: {addr}"),
             )
         })?;
         let prefix_len: u8 = prefix.parse().map_err(|e| {
@@ -111,18 +118,17 @@ where
     D: serde::Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    parse_mac(&s).map_err(serde::de::Error::custom)
+    let mac: MacAddr = s.parse().map_err(serde::de::Error::custom)?;
+    Ok(mac.0)
 }
 
-fn parse_mac(s: &str) -> Result<[u8; 6], String> {
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 6 {
-        return Err(format!("expected 6 colon-separated octets, got: {s}"));
-    }
-    let mut mac = [0u8; 6];
-    for (i, part) in parts.iter().enumerate() {
-        mac[i] = u8::from_str_radix(part, 16)
-            .map_err(|_| format!("invalid hex octet '{part}' in MAC: {s}"))?;
-    }
-    Ok(mac)
+fn deserialize_optional_mac<'de, D>(deserializer: D) -> Result<Option<MacAddr>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(s) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let mac: MacAddr = s.parse().map_err(serde::de::Error::custom)?;
+    Ok(Some(mac))
 }

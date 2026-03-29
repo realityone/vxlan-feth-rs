@@ -3,16 +3,21 @@ server:
   vni: 100
 
 interface:
-  io_unit: 101
-  ip_unit: 100
-  address: "10.0.0.2/24"
-  mtu: 1450
+  io:
+    unit: 101
+    mtu: 1450
+    # mac: "02:aa:bb:cc:dd:ee"  # Optional; random if omitted
+  ip:
+    unit: 100
+    address: "10.0.0.2/24"
+    mtu: 1450
+    # mac: "02:aa:bb:cc:dd:ee"  # Optional; random if omitted
 
 fdb:
   # BUM entry — flood broadcast/unknown-unicast/multicast to these VTEPs
   - mac: "00:00:00:00:00:00"
-    dst: "192.168.50.212:4789"
+    dst: "192.168.50.81:4789"
 
   # Static unicast entries — known MAC-to-VTEP mappings
-  - mac: "46:69:54:77:86:17"
-    dst: "192.168.50.212:4789"
+  # - mac: "46:69:54:77:86:17"
+  #   dst: "192.168.50.212:4789"
