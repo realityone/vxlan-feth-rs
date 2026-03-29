@@ -27,7 +27,8 @@ enum Command {
 enum ServerAction {
     /// Start the VXLAN server.
     Up {
-        /// Path to the YAML config file.
+        /// Path to the YAML config file [default: vxlan-feth.yaml].
+        #[arg(default_value = "vxlan-feth.yaml")]
         config: PathBuf,
     },
 }
