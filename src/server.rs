@@ -4,6 +4,7 @@ use std::{
     io,
     net::SocketAddr,
     os::fd::AsRawFd,
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
     time::Instant,
 };
 
@@ -13,6 +14,107 @@ use crate::{
     config::{self, FdbEntry},
     protocol::{self, EthernetHeader, VxlanHdr},
 };
+
+/// Tunnel traffic statistics, similar to `ip -s link show` on Linux.
+#[derive(Debug, Default)]
+struct TunnelStats {
+    /// RX: packets received from remote VTEPs (UDP → feth).
+    rx_packets: AtomicU64,
+    /// RX: bytes received (inner frame bytes, excluding VXLAN header).
+    rx_bytes: AtomicU64,
+    /// RX: packets dropped (invalid VXLAN header, wrong VNI, too short).
+    rx_drops: AtomicU64,
+    /// RX: packets with invalid VXLAN header.
+    rx_invalid: AtomicU64,
+
+    /// TX: packets sent to remote VTEPs (feth → UDP).
+    tx_packets: AtomicU64,
+    /// TX: bytes sent (inner frame bytes, excluding VXLAN header).
+    tx_bytes: AtomicU64,
+    /// TX: send errors.
+    tx_errors: AtomicU64,
+    /// TX: packets suppressed by split-horizon.
+    tx_split_horizon: AtomicU64,
+    /// TX: packets dropped due to empty FDB lookup.
+    tx_no_route: AtomicU64,
+}
+
+/// Snapshot of counters for computing deltas between reporting intervals.
+#[derive(Debug, Default)]
+struct StatsSnapshot {
+    rx_packets: u64,
+    rx_bytes: u64,
+    rx_drops: u64,
+    rx_invalid: u64,
+    tx_packets: u64,
+    tx_bytes: u64,
+    tx_errors: u64,
+    tx_split_horizon: u64,
+    tx_no_route: u64,
+}
+
+/// Split-horizon suppressions per second above this threshold trigger a
+/// flood-loop warning.
+const FLOOD_LOOP_WARN_PPS: u64 = 100;
+
+impl TunnelStats {
+    fn snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            rx_packets: self.rx_packets.load(Relaxed),
+            rx_bytes: self.rx_bytes.load(Relaxed),
+            rx_drops: self.rx_drops.load(Relaxed),
+            rx_invalid: self.rx_invalid.load(Relaxed),
+            tx_packets: self.tx_packets.load(Relaxed),
+            tx_bytes: self.tx_bytes.load(Relaxed),
+            tx_errors: self.tx_errors.load(Relaxed),
+            tx_split_horizon: self.tx_split_horizon.load(Relaxed),
+            tx_no_route: self.tx_no_route.load(Relaxed),
+        }
+    }
+
+    fn log_summary(&self, prev: &StatsSnapshot, elapsed_secs: u64) -> StatsSnapshot {
+        let curr = self.snapshot();
+        let secs = elapsed_secs.max(1);
+
+        let d_rx_pkts = curr.rx_packets - prev.rx_packets;
+        let d_rx_bytes = curr.rx_bytes - prev.rx_bytes;
+        let d_rx_drops = curr.rx_drops - prev.rx_drops;
+        let d_rx_invalid = curr.rx_invalid - prev.rx_invalid;
+        let d_tx_pkts = curr.tx_packets - prev.tx_packets;
+        let d_tx_bytes = curr.tx_bytes - prev.tx_bytes;
+        let d_tx_errors = curr.tx_errors - prev.tx_errors;
+        let d_tx_sh = curr.tx_split_horizon - prev.tx_split_horizon;
+        let d_tx_no_route = curr.tx_no_route - prev.tx_no_route;
+
+        tracing::info!(
+            rx_pps = d_rx_pkts / secs,
+            rx_bps = d_rx_bytes / secs,
+            rx_drops = d_rx_drops,
+            rx_invalid = d_rx_invalid,
+            tx_pps = d_tx_pkts / secs,
+            tx_bps = d_tx_bytes / secs,
+            tx_errors = d_tx_errors,
+            tx_split_horizon = d_tx_sh,
+            tx_no_route = d_tx_no_route,
+            total_rx = curr.rx_packets,
+            total_tx = curr.tx_packets,
+            "tunnel stats",
+        );
+
+        // Flood-loop detection: high split-horizon suppression rate means a
+        // remote VTEP is likely re-flooding frames without split-horizon.
+        let sh_pps = d_tx_sh / secs;
+        if sh_pps > FLOOD_LOOP_WARN_PPS {
+            tracing::warn!(
+                split_horizon_pps = sh_pps,
+                "possible flood loop: high split-horizon suppression rate, \
+                 check that all VTEP peers have split-horizon enabled",
+            );
+        }
+
+        curr
+    }
+}
 
 /// Maximum UDP datagram we expect: VXLAN header + inner Ethernet frame (jumbo-safe).
 const MAX_RECV_BUF: usize = 65535;
@@ -24,6 +126,9 @@ const SO_SNDBUF_SIZE: libc::c_int = 4 * 1024 * 1024;
 
 /// Learned MAC entries expire after this duration.
 const LEARNED_MAC_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Interval between stats log lines.
+const STATS_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Forwarding database: maps destination MAC to remote VTEP(s).
 ///
@@ -152,6 +257,7 @@ pub struct VxlanServer {
     socket: UdpSocket,
     feth_io: feth_rs::feth_tokio::AsyncFethIO,
     fdb: Fdb,
+    stats: TunnelStats,
 }
 
 impl VxlanServer {
@@ -179,6 +285,7 @@ impl VxlanServer {
             socket,
             feth_io,
             fdb,
+            stats: TunnelStats::default(),
         })
     }
 
@@ -216,6 +323,9 @@ impl VxlanServer {
         let mut udp_buf = vec![0u8; MAX_RECV_BUF];
         let mut feth_buf = vec![0u8; MAX_RECV_BUF];
         let mut gc_interval = tokio::time::interval(LEARNED_MAC_TTL / 2);
+        let mut stats_interval = tokio::time::interval(STATS_LOG_INTERVAL);
+        let mut stats_prev = StatsSnapshot::default();
+        let mut stats_last = Instant::now();
 
         loop {
             tokio::select! {
@@ -242,6 +352,14 @@ impl VxlanServer {
                 _ = gc_interval.tick() => {
                     self.fdb.gc_learned();
                 }
+
+                // Periodic stats reporting with rate computation.
+                _ = stats_interval.tick() => {
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(stats_last).as_secs();
+                    stats_prev = self.stats.log_summary(&stats_prev, elapsed);
+                    stats_last = now;
+                }
             }
         }
     }
@@ -251,14 +369,19 @@ impl VxlanServer {
     fn handle_rx(&self, data: &[u8], peer: SocketAddr) {
         let (vxlan, inner_frame) = match VxlanHdr::from_bytes(data) {
             Ok(parsed) => parsed,
-            Err(_) => return,
+            Err(_) => {
+                self.stats.rx_invalid.fetch_add(1, Relaxed);
+                return;
+            }
         };
 
         if vxlan.vni() != self.vni {
+            self.stats.rx_drops.fetch_add(1, Relaxed);
             return;
         }
 
         if inner_frame.len() < protocol::ETH_HEADER_LEN {
+            self.stats.rx_drops.fetch_add(1, Relaxed);
             return;
         }
 
@@ -269,7 +392,12 @@ impl VxlanServer {
 
         if let Err(e) = self.feth_io.send(inner_frame) {
             tracing::warn!(error = %e, "failed to inject frame into feth");
+            self.stats.rx_drops.fetch_add(1, Relaxed);
+            return;
         }
+
+        self.stats.rx_packets.fetch_add(1, Relaxed);
+        self.stats.rx_bytes.fetch_add(inner_frame.len() as u64, Relaxed);
     }
 
     /// Handle an outgoing frame from feth: FDB lookup → VXLAN encap → sendmsg.
@@ -291,6 +419,7 @@ impl VxlanServer {
 
         let destinations = self.fdb.lookup(&dst_mac);
         if destinations.is_empty() {
+            self.stats.tx_no_route.fetch_add(1, Relaxed);
             return;
         }
 
@@ -308,6 +437,7 @@ impl VxlanServer {
                     remote = %remote,
                     "split-horizon: skipping originating VTEP",
                 );
+                self.stats.tx_split_horizon.fetch_add(1, Relaxed);
                 continue;
             }
 
@@ -315,13 +445,20 @@ impl VxlanServer {
                 sendmsg_udp(self.socket.as_raw_fd(), &[hdr_bytes, frame], remote)
             });
 
-            if let Err(e) = result {
-                tracing::warn!(
-                    error = %e,
-                    dst = %config::format_mac(&dst_mac),
-                    remote = %remote,
-                    "failed to send vxlan datagram",
-                );
+            match result {
+                Ok(n) => {
+                    self.stats.tx_packets.fetch_add(1, Relaxed);
+                    self.stats.tx_bytes.fetch_add(n as u64, Relaxed);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        dst = %config::format_mac(&dst_mac),
+                        remote = %remote,
+                        "failed to send vxlan datagram",
+                    );
+                    self.stats.tx_errors.fetch_add(1, Relaxed);
+                }
             }
         }
     }
