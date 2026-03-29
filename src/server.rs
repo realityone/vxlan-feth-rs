@@ -116,8 +116,13 @@ impl TunnelStats {
     }
 }
 
-/// Maximum UDP datagram we expect: VXLAN header + inner Ethernet frame (jumbo-safe).
-const MAX_RECV_BUF: usize = 65535;
+/// Maximum UDP datagram size: full 16-bit UDP length field.
+/// Avoids truncation on `recvfrom` regardless of inner MTU.
+const MAX_UDP_BUF: usize = 65535;
+
+/// Maximum single ethernet frame from BPF.
+/// Covers jumbo frames (9000) + ethernet header (14) + VLAN tags (4) + margin.
+const MAX_ETHER_BUF: usize = 9216;
 
 /// Socket receive buffer size (4 MiB).
 const SO_RCVBUF_SIZE: libc::c_int = 4 * 1024 * 1024;
@@ -128,7 +133,7 @@ const SO_SNDBUF_SIZE: libc::c_int = 4 * 1024 * 1024;
 const LEARNED_MAC_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Interval between stats log lines.
-const STATS_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const STATS_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Forwarding database: maps destination MAC to remote VTEP(s).
 ///
@@ -315,13 +320,15 @@ impl VxlanServer {
     /// re-entering the event loop to reduce epoll overhead.
     pub async fn run<F>(mut self, on_ready: F) -> io::Result<()>
     where
-        F: for<'a> FnOnce(&'a Self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>,
+        F: for<'a> FnOnce(
+            &'a Self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>,
     {
         on_ready(&self).await;
 
         let vxlan_hdr = VxlanHdr::new(self.vni);
-        let mut udp_buf = vec![0u8; MAX_RECV_BUF];
-        let mut feth_buf = vec![0u8; MAX_RECV_BUF];
+        let mut udp_buf = vec![0u8; MAX_UDP_BUF];
+        let mut feth_buf = vec![0u8; MAX_ETHER_BUF];
         let mut gc_interval = tokio::time::interval(LEARNED_MAC_TTL / 2);
         let mut stats_interval = tokio::time::interval(STATS_LOG_INTERVAL);
         let mut stats_prev = StatsSnapshot::default();
@@ -346,6 +353,10 @@ impl VxlanServer {
                 result = self.feth_io.recv(&mut feth_buf) => {
                     let n = result?;
                     self.handle_tx(&vxlan_hdr, &feth_buf[..n]).await;
+                    // Drain remaining buffered BPF frames without waiting for I/O.
+                    while let Some(n) = self.feth_io.try_next_frame(&mut feth_buf)? {
+                        self.handle_tx(&vxlan_hdr, &feth_buf[..n]).await;
+                    }
                 }
 
                 // Periodic GC of expired learned MAC entries.
@@ -397,7 +408,9 @@ impl VxlanServer {
         }
 
         self.stats.rx_packets.fetch_add(1, Relaxed);
-        self.stats.rx_bytes.fetch_add(inner_frame.len() as u64, Relaxed);
+        self.stats
+            .rx_bytes
+            .fetch_add(inner_frame.len() as u64, Relaxed);
     }
 
     /// Handle an outgoing frame from feth: FDB lookup → VXLAN encap → sendmsg.
