@@ -101,7 +101,6 @@ fn setup_interfaces(
         .addr(addr, prefix)
         .mtu(ip_cfg.mtu)
         .up()
-        .ipv6(true, false)
         .build()?;
 
     // Create IO-side feth with peer pointing to IP side.
