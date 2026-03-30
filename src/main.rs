@@ -3,14 +3,12 @@ pub mod inspect;
 pub mod protocol;
 pub mod server;
 
-use std::{net::Ipv4Addr, path::PathBuf, thread, time::Duration};
+use std::{net::Ipv4Addr, path::PathBuf};
 
 use clap::{Parser, Subcommand};
-use feth_rs::feth::{Feth, MacAddr};
-
-fn settle() {
-    thread::sleep(Duration::from_micros(200));
-}
+use feth_rs::builder::{Backend, FethBuilder, FethHandle};
+use feth_rs::feth::MacAddr;
+use feth_rs::ifconfig::IfconfigFeth;
 
 #[derive(Parser)]
 #[command(name = "vxlan-feth", about = "Userspace VXLAN tunnel over feth")]
@@ -58,15 +56,15 @@ enum InspectQuery {
 
 /// Result of setting up the feth interface pair.
 struct InterfaceSetup {
-    feth_io: Feth,
-    feth_ip: Feth,
+    feth_io: FethHandle,
+    feth_ip: FethHandle,
     /// MAC address assigned to the IP-side interface.
     ip_mac: MacAddr,
     /// Overlay IPv4 address.
     ip_addr: Ipv4Addr,
 }
 
-/// Create and configure the feth pair from config.
+/// Create and configure the feth pair from config using the ifconfig backend.
 fn setup_interfaces(
     iface: &config::InterfaceConfig,
 ) -> Result<InterfaceSetup, feth_rs::feth::Error> {
@@ -76,53 +74,45 @@ fn setup_interfaces(
     let ip_name = ip_cfg.name();
 
     // Clean up any leftover interfaces first.
-    if let Ok(old) = Feth::from_existing(&io_name) {
+    if let Ok(old) = IfconfigFeth::from_existing(&io_name) {
         let _ = old.destroy();
     }
-    if let Ok(old) = Feth::from_existing(&ip_name) {
+    if let Ok(old) = IfconfigFeth::from_existing(&ip_name) {
         let _ = old.destroy();
     }
 
     tracing::info!(io = %io_name, ip = %ip_name, "creating feth pair");
 
-    let feth_io = Feth::create(io_cfg.unit)?;
-    settle();
-    let feth_ip = Feth::create(ip_cfg.unit)?;
-    settle();
-
-    feth_io.set_peer(feth_ip.name())?;
-    settle();
-
-    // Set MAC addresses (random if not configured).
     let io_mac = io_cfg.mac.unwrap_or_else(MacAddr::random);
     let ip_mac = ip_cfg.mac.unwrap_or_else(MacAddr::random);
-    feth_io.set_mac(&io_mac)?;
-    feth_ip.set_mac(&ip_mac)?;
-    settle();
 
-    // I/O side: no IP — raw frames only.
-    feth_io.set_mtu(io_cfg.mtu)?;
-    feth_io.up()?;
-    settle();
-
-    // IP side.
     let (addr, prefix) = ip_cfg
         .parse_address()
         .map_err(|e| feth_rs::feth::Error::InvalidName(e.to_string()))?;
     let ip_addr: Ipv4Addr = addr
         .parse()
         .map_err(|e: std::net::AddrParseError| feth_rs::feth::Error::InvalidName(e.to_string()))?;
-    feth_ip.set_inet(addr, prefix)?;
-    feth_ip.set_mtu(ip_cfg.mtu)?;
-    feth_ip.up()?;
-    settle();
 
-    // Enable NDP Neighbor Unreachability Detection and disable Router
-    // Advertisement acceptance on the IP-side interface.
-    if let Err(e) = feth_ip.configure_ipv6(true, false) {
-        tracing::warn!(error = %e, "failed to configure IPv6 NDP parameters");
-    }
-    settle();
+    // Create IP-side feth first (no peer needed).
+    let feth_ip = FethBuilder::new()
+        .backend(Backend::Ifconfig)
+        .unit(ip_cfg.unit)
+        .mac(ip_mac)
+        .addr(addr, prefix)
+        .mtu(ip_cfg.mtu)
+        .up()
+        .ipv6(true, false)
+        .build()?;
+
+    // Create IO-side feth with peer pointing to IP side.
+    let feth_io = FethBuilder::new()
+        .backend(Backend::Ifconfig)
+        .unit(io_cfg.unit)
+        .peer(&ip_name)
+        .mac(io_mac)
+        .mtu(io_cfg.mtu)
+        .up()
+        .build()?;
 
     tracing::info!(
         ip_iface = %ip_name,

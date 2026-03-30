@@ -57,6 +57,24 @@ const SO_SNDBUF_SIZE: libc::c_int = 4 * 1024 * 1024;
 /// Learned MAC entries expire after this duration.
 const LEARNED_MAC_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Result of an FDB lookup — either a borrowed slice (static/BUM) or an
+/// owned single address (learned).
+enum FdbLookup<'a> {
+    /// One or more static destinations (unicast hit or BUM flood list).
+    Static(&'a [SocketAddr]),
+    /// A single destination resolved from the learned MAC table.
+    Learned(SocketAddr),
+}
+
+impl FdbLookup<'_> {
+    fn as_slice(&self) -> &[SocketAddr] {
+        match self {
+            Self::Static(s) => s,
+            Self::Learned(addr) => std::slice::from_ref(addr),
+        }
+    }
+}
+
 /// Forwarding database: maps destination MAC to remote VTEP(s).
 ///
 /// - Unicast entries (`mac != 00:00:00:00:00:00`) map to a single VTEP.
@@ -69,15 +87,18 @@ pub struct Fdb {
     /// Flood list for broadcast / unknown-unicast / multicast.
     pub bum: Vec<SocketAddr>,
     /// Source MAC → (remote VTEP IP, last seen time) learned from incoming
-    /// VXLAN packets.  Used for split-horizon: don't flood a frame back to
-    /// the VTEP that originated it.  Entries expire after `LEARNED_MAC_TTL`.
+    /// VXLAN packets.  Used for unicast forwarding (avoiding floods) and
+    /// split-horizon filtering (don't send a frame back to the VTEP that
+    /// originated it).  Entries expire after `LEARNED_MAC_TTL`.
     pub learned: RwLock<HashMap<[u8; 6], (std::net::IpAddr, Instant)>>,
     /// Maximum number of learned MAC entries.
     max_learned: usize,
+    /// VXLAN destination port used when forwarding to learned peers.
+    vxlan_port: u16,
 }
 
 impl Fdb {
-    fn new(entries: &[FdbEntry], max_learned: usize) -> Self {
+    fn new(entries: &[FdbEntry], max_learned: usize, vxlan_port: u16) -> Self {
         let mut unicast = HashMap::new();
         let mut bum = Vec::new();
         for entry in entries {
@@ -92,6 +113,7 @@ impl Fdb {
             bum,
             learned: RwLock::new(HashMap::new()),
             max_learned,
+            vxlan_port,
         }
     }
 
@@ -149,21 +171,31 @@ impl Fdb {
         }
     }
 
-    /// Look up destinations for a given destination MAC.
+    /// Look up destinations for a destination MAC.
     ///
-    /// Returns a single VTEP for known unicast, or the full BUM flood list
-    /// for broadcast/multicast/unknown destinations.
-    fn lookup(&self, dst_mac: [u8; 6]) -> &[SocketAddr] {
+    /// Resolution order (mirrors Linux `vxlan_xmit`):
+    /// 1. Broadcast/multicast → BUM flood list.
+    /// 2. Static unicast FDB entry → single VTEP.
+    /// 3. Learned MAC → single VTEP (IP from learned table + configured port).
+    /// 4. Unknown unicast → BUM flood list.
+    fn lookup(&self, dst_mac: [u8; 6]) -> FdbLookup<'_> {
         // Broadcast / multicast — always flood.
         if dst_mac[0] & 0x01 != 0 {
-            return &self.bum;
+            return FdbLookup::Static(&self.bum);
         }
-        // Known unicast.
+        // Static unicast.
         if let Some(addr) = self.unicast.get(&dst_mac) {
-            return std::slice::from_ref(addr);
+            return FdbLookup::Static(std::slice::from_ref(addr));
+        }
+        // Learned unicast.
+        let table = self.learned.read().unwrap();
+        if let Some(&(ip, ts)) = table.get(&dst_mac) {
+            if ts.elapsed() < LEARNED_MAC_TTL {
+                return FdbLookup::Learned(SocketAddr::new(ip, self.vxlan_port));
+            }
         }
         // Unknown unicast — flood.
-        &self.bum
+        FdbLookup::Static(&self.bum)
     }
 }
 
@@ -194,7 +226,7 @@ impl VxlanServer {
         set_sock_buf_size(socket.as_raw_fd());
 
         let max_learned = config.interface.subnet_host_count();
-        let fdb = Fdb::new(&config.fdb, max_learned);
+        let fdb = Fdb::new(&config.fdb, max_learned, config.server.listen.port());
 
         tracing::info!(
             listen = %config.server.listen,
@@ -349,7 +381,8 @@ impl VxlanServer {
             Err(_) => return,
         };
 
-        let destinations = self.fdb.lookup(dst_mac);
+        let result = self.fdb.lookup(dst_mac);
+        let destinations = result.as_slice();
         if destinations.is_empty() {
             self.stats.tx_no_route.fetch_add(1, Relaxed);
             return;
