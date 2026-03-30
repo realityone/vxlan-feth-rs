@@ -3,10 +3,14 @@ pub mod inspect;
 pub mod protocol;
 pub mod server;
 
-use std::{net::Ipv4Addr, path::PathBuf};
+use std::{net::Ipv4Addr, path::PathBuf, thread, time::Duration};
 
 use clap::{Parser, Subcommand};
 use feth_rs::feth::{Feth, MacAddr};
+
+fn settle() {
+    thread::sleep(Duration::from_micros(200));
+}
 
 #[derive(Parser)]
 #[command(name = "vxlan-feth", about = "Userspace VXLAN tunnel over feth")]
@@ -82,19 +86,24 @@ fn setup_interfaces(
     tracing::info!(io = %io_name, ip = %ip_name, "creating feth pair");
 
     let feth_io = Feth::create(io_cfg.unit)?;
+    settle();
     let feth_ip = Feth::create(ip_cfg.unit)?;
+    settle();
 
     feth_io.set_peer(feth_ip.name())?;
+    settle();
 
     // Set MAC addresses (random if not configured).
     let io_mac = io_cfg.mac.unwrap_or_else(MacAddr::random);
     let ip_mac = ip_cfg.mac.unwrap_or_else(MacAddr::random);
     feth_io.set_mac(&io_mac)?;
     feth_ip.set_mac(&ip_mac)?;
+    settle();
 
     // I/O side: no IP — raw frames only.
     feth_io.set_mtu(io_cfg.mtu)?;
     feth_io.up()?;
+    settle();
 
     // IP side.
     let (addr, prefix) = ip_cfg
@@ -106,6 +115,14 @@ fn setup_interfaces(
     feth_ip.set_inet(addr, prefix)?;
     feth_ip.set_mtu(ip_cfg.mtu)?;
     feth_ip.up()?;
+    settle();
+
+    // Enable NDP Neighbor Unreachability Detection and disable Router
+    // Advertisement acceptance on the IP-side interface.
+    if let Err(e) = feth_ip.configure_ipv6(true, false) {
+        tracing::warn!(error = %e, "failed to configure IPv6 NDP parameters");
+    }
+    settle();
 
     tracing::info!(
         ip_iface = %ip_name,

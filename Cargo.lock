@@ -194,7 +194,7 @@ dependencies = [
 [[package]]
 name = "feth-rs"
 version = "0.1.0"
-source = "git+https://github.com/realityone/feth-rs#3b42f42fe6eee76d7be524e45df51aa66a481f13"
+source = "git+https://github.com/realityone/feth-rs#97e3c8be8d85322b59cb74a79dc732b339f91be5"
 dependencies = [
  "libc",
  "nix",
