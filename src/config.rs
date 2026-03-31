@@ -21,6 +21,8 @@ pub struct ServerConfig {
     /// Inspect API unix socket path (e.g. "/tmp/vxlan-feth.sock").
     /// Defaults to "/tmp/vxlan-feth.sock".
     pub api: Option<String>,
+    /// BPF→TX channel capacity. Defaults to 2048.
+    pub bpf_channel_cap: Option<usize>,
 }
 
 /// feth interface pair settings.

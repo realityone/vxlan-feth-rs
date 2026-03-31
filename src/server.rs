@@ -57,9 +57,8 @@ const SO_SNDBUF_SIZE: libc::c_int = 4 * 1024 * 1024;
 /// Learned MAC entries expire after this duration.
 const LEARNED_MAC_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Channel capacity between the BPF reader and TX handler.
-/// Sized to absorb bursts without back-pressuring the BPF reader.
-const BPF_CHANNEL_CAP: usize = 256;
+/// Default channel capacity between the BPF reader and TX handler.
+const DEFAULT_BPF_CHANNEL_CAP: usize = 2048;
 
 /// Result of an FDB lookup — either a borrowed slice (static/BUM) or an
 /// owned single address (learned).
@@ -203,6 +202,7 @@ pub struct VxlanServer {
     feth_io: feth_rs::feth_tokio::AsyncFethIO,
     fdb: Arc<Fdb>,
     stats: Arc<TunnelStats>,
+    bpf_channel_cap: usize,
 }
 
 impl VxlanServer {
@@ -225,12 +225,14 @@ impl VxlanServer {
         );
 
         let feth_io = feth_rs::feth_tokio::AsyncFethIO::open(&config.interface.io.name())?;
+        let bpf_channel_cap = config.server.bpf_channel_cap.unwrap_or(DEFAULT_BPF_CHANNEL_CAP);
         Ok(Self {
             vni: config.server.vni,
             socket,
             feth_io,
             fdb: Arc::new(fdb),
             stats: Arc::new(TunnelStats::default()),
+            bpf_channel_cap,
         })
     }
 
@@ -259,7 +261,7 @@ impl VxlanServer {
         let (bpf_reader, ndrv_writer) = self.feth_io.into_split();
 
         // Channel between BPF reader and TX handler.
-        let (bpf_tx, mut bpf_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(BPF_CHANNEL_CAP);
+        let (bpf_tx, mut bpf_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(self.bpf_channel_cap);
 
         // BPF read task: drain frames from the BPF device as fast as possible.
         let bpf_read_task = {
@@ -322,14 +324,7 @@ impl VxlanServer {
                     loop {
                         match socket.try_recv_from(&mut udp_buf) {
                             Ok((n, peer)) => {
-                                Self::do_handle_rx(
-                                    &writer,
-                                    &fdb,
-                                    &stats,
-                                    vni,
-                                    &udp_buf[..n],
-                                    peer,
-                                );
+                                Self::do_handle_rx(&writer, &fdb, &stats, vni, &udp_buf[..n], peer);
                             }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                             Err(e) => return Err(e),
