@@ -55,6 +55,10 @@ const SO_SNDBUF_SIZE: libc::c_int = 4 * 1024 * 1024;
 /// Learned MAC entries expire after this duration.
 const LEARNED_MAC_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Channel capacity between the BPF reader and TX handler.
+/// Sized to absorb bursts without back-pressuring the BPF reader.
+const BPF_CHANNEL_CAP: usize = 256;
+
 /// Result of an FDB lookup — either a borrowed slice (static/BUM) or an
 /// owned single address (learned).
 enum FdbLookup<'a> {
@@ -240,88 +244,157 @@ impl VxlanServer {
 
     /// Run the server, forwarding packets in both directions until cancelled.
     ///
-    /// After each readiness notification, drains all available packets before
-    /// re-entering the event loop to reduce epoll overhead.
-    pub async fn run(mut self) -> io::Result<()> {
-        let vxlan_hdr = VxlanHdr::new(self.vni);
-        let mut udp_buf = vec![0u8; MAX_UDP_BUF];
-        let mut feth_buf = vec![0u8; MAX_ETHER_BUF];
-        let mut gc_interval = tokio::time::interval(LEARNED_MAC_TTL / 2);
+    /// Spawns three concurrent tasks:
+    /// - **BPF task**: reads frames from feth (BPF), encapsulates and sends via UDP.
+    /// - **NDRV task**: reads UDP datagrams, decapsulates and injects into feth (NDRV).
+    /// - **GC task**: periodically evicts expired learned MAC entries.
+    pub async fn run(self) -> io::Result<()> {
+        let vni = self.vni;
+        let vxlan_hdr = VxlanHdr::new(vni);
+        let socket = Arc::new(self.socket);
+        let fdb = self.fdb;
+        let stats = self.stats;
+        let (bpf_reader, ndrv_writer) = self.feth_io.into_split();
 
-        loop {
-            tokio::select! {
-                // RX path: UDP → feth (decapsulation)
-                result = self.socket.readable() => {
-                    result?;
+        // Channel between BPF reader and TX handler.
+        let (bpf_tx, mut bpf_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(BPF_CHANNEL_CAP);
+
+        // BPF read task: drain frames from the BPF device as fast as possible.
+        let bpf_read_task = {
+            let mut reader = bpf_reader;
+            tokio::spawn(async move {
+                let mut feth_buf = vec![0u8; MAX_ETHER_BUF];
+                loop {
+                    let n = reader.recv(&mut feth_buf).await?;
+                    if bpf_tx.send(feth_buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
+                    // Drain remaining buffered BPF frames without waiting for I/O.
+                    while let Some(n) = reader.try_next_frame(&mut feth_buf)? {
+                        if bpf_tx.send(feth_buf[..n].to_vec()).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(())
+            })
+        };
+
+        // TX task: receive frames from the channel and encapsulate into VXLAN.
+        let tx_task = {
+            let socket = socket.clone();
+            let fdb = fdb.clone();
+            let stats = stats.clone();
+            tokio::spawn(async move {
+                while let Some(frame) = bpf_rx.recv().await {
+                    Self::do_handle_tx(&socket, &fdb, &stats, &vxlan_hdr, &frame).await;
+                }
+                Ok(())
+            })
+        };
+
+        // NDRV task: UDP → feth (RX path / decapsulation)
+        let ndrv_task = {
+            let socket = socket.clone();
+            let fdb = fdb.clone();
+            let stats = stats.clone();
+            let writer = ndrv_writer;
+            tokio::spawn(async move {
+                let mut udp_buf = vec![0u8; MAX_UDP_BUF];
+                loop {
+                    socket.readable().await?;
                     // Drain all queued datagrams before re-polling.
                     loop {
-                        match self.socket.try_recv_from(&mut udp_buf) {
-                            Ok((n, peer)) => self.handle_rx(&udp_buf[..n], peer),
+                        match socket.try_recv_from(&mut udp_buf) {
+                            Ok((n, peer)) => {
+                                Self::do_handle_rx(
+                                    &writer,
+                                    &fdb,
+                                    &stats,
+                                    vni,
+                                    &udp_buf[..n],
+                                    peer,
+                                );
+                            }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                             Err(e) => return Err(e),
                         }
                     }
                 }
+            })
+        };
 
-                // TX path: feth → UDP (encapsulation)
-                result = self.feth_io.recv(&mut feth_buf) => {
-                    let n = result?;
-                    self.handle_tx(&vxlan_hdr, &feth_buf[..n]).await;
-                    // Drain remaining buffered BPF frames without waiting for I/O.
-                    while let Some(n) = self.feth_io.try_next_frame(&mut feth_buf)? {
-                        self.handle_tx(&vxlan_hdr, &feth_buf[..n]).await;
-                    }
+        // GC task: periodic cleanup of expired learned MAC entries.
+        let gc_task = {
+            let fdb = fdb.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(LEARNED_MAC_TTL / 2);
+                loop {
+                    interval.tick().await;
+                    fdb.gc_learned();
                 }
+            })
+        };
 
-                // Periodic GC of expired learned MAC entries.
-                _ = gc_interval.tick() => {
-                    self.fdb.gc_learned();
-                }
-
-            }
+        tokio::select! {
+            result = bpf_read_task => result.expect("bpf read task panicked"),
+            result = tx_task => result.expect("tx task panicked"),
+            result = ndrv_task => result.expect("ndrv task panicked"),
+            _ = gc_task => Ok(()),
         }
     }
 
     /// Handle an incoming UDP datagram: parse VXLAN, validate VNI, learn source
-    /// MAC for split-horizon, inject inner frame.
-    fn handle_rx(&self, data: &[u8], peer: SocketAddr) {
+    /// MAC, inject inner frame via the NDRV writer.
+    fn do_handle_rx(
+        writer: &feth_rs::feth_tokio::NdrvWriter,
+        fdb: &Fdb,
+        stats: &TunnelStats,
+        vni: u32,
+        data: &[u8],
+        peer: SocketAddr,
+    ) {
         let Ok((vxlan, inner_frame)) = VxlanHdr::from_bytes(data) else {
-            self.stats.rx_invalid.fetch_add(1, Relaxed);
+            stats.rx_invalid.fetch_add(1, Relaxed);
             return;
         };
 
-        if vxlan.vni() != self.vni {
-            self.stats.rx_drops.fetch_add(1, Relaxed);
+        if vxlan.vni() != vni {
+            stats.rx_drops.fetch_add(1, Relaxed);
             return;
         }
 
         if inner_frame.len() < protocol::ETH_HEADER_LEN {
-            self.stats.rx_drops.fetch_add(1, Relaxed);
+            stats.rx_drops.fetch_add(1, Relaxed);
             return;
         }
 
         // Learn source MAC → remote VTEP for split-horizon filtering.
         if let Ok((eth, _)) = EthernetHeader::from_bytes(inner_frame) {
-            self.fdb.learn(eth.src_mac, peer);
+            fdb.learn(eth.src_mac, peer);
         }
 
-        if let Err(e) = self.feth_io.send(inner_frame) {
+        if let Err(e) = writer.send(inner_frame) {
             tracing::warn!(error = %e, "failed to inject frame into feth");
-            self.stats.rx_drops.fetch_add(1, Relaxed);
+            stats.rx_drops.fetch_add(1, Relaxed);
             return;
         }
 
-        self.stats.rx_packets.fetch_add(1, Relaxed);
-        self.stats
-            .rx_bytes
-            .fetch_add(inner_frame.len() as u64, Relaxed);
+        stats.rx_packets.fetch_add(1, Relaxed);
+        stats.rx_bytes.fetch_add(inner_frame.len() as u64, Relaxed);
     }
 
     /// Handle an outgoing frame from feth: FDB lookup → VXLAN encap → sendmsg.
     ///
     /// Uses `sendmsg` with `iovec` to scatter-gather the VXLAN header and
     /// inner frame, avoiding a copy into a contiguous buffer.
-    async fn handle_tx(&self, vxlan_hdr: &VxlanHdr, frame: &[u8]) {
+    async fn do_handle_tx(
+        socket: &UdpSocket,
+        fdb: &Fdb,
+        stats: &TunnelStats,
+        vxlan_hdr: &VxlanHdr,
+        frame: &[u8],
+    ) {
         if frame.len() < protocol::ETH_HEADER_LEN {
             return;
         }
@@ -331,25 +404,25 @@ impl VxlanServer {
             Err(_) => return,
         };
 
-        let result = self.fdb.lookup(dst_mac);
+        let result = fdb.lookup(dst_mac);
         let destinations = result.as_slice();
         if destinations.is_empty() {
-            self.stats.tx_no_route.fetch_add(1, Relaxed);
+            stats.tx_no_route.fetch_add(1, Relaxed);
             return;
         }
 
         let hdr_bytes = vxlan_hdr.as_bytes();
-        self.socket.writable().await.ok();
+        socket.writable().await.ok();
 
         for &remote in destinations {
-            let result = self.socket.try_io(Interest::WRITABLE, || {
-                sendmsg_udp(self.socket.as_raw_fd(), &[hdr_bytes, frame], remote)
+            let result = socket.try_io(Interest::WRITABLE, || {
+                sendmsg_udp(socket.as_raw_fd(), &[hdr_bytes, frame], remote)
             });
 
             match result {
                 Ok(n) => {
-                    self.stats.tx_packets.fetch_add(1, Relaxed);
-                    self.stats.tx_bytes.fetch_add(n as u64, Relaxed);
+                    stats.tx_packets.fetch_add(1, Relaxed);
+                    stats.tx_bytes.fetch_add(n as u64, Relaxed);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -358,7 +431,7 @@ impl VxlanServer {
                         remote = %remote,
                         "failed to send vxlan datagram",
                     );
-                    self.stats.tx_errors.fetch_add(1, Relaxed);
+                    stats.tx_errors.fetch_add(1, Relaxed);
                 }
             }
         }
