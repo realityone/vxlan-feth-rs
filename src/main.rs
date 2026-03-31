@@ -207,6 +207,7 @@ async fn cmd_inspect(server: PathBuf, query: InspectQuery) -> std::io::Result<()
                 stats.tx_packets, stats.tx_bytes, stats.tx_errors
             );
             println!("    no-route: {}", stats.tx_no_route);
+            println!("    chan-drops: {}", stats.tx_chan_drops);
         }
     }
     Ok(())

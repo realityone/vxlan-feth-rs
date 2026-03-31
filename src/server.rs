@@ -37,6 +37,8 @@ pub struct TunnelStats {
     pub tx_errors: AtomicU64,
     /// TX: packets dropped due to empty FDB lookup.
     pub tx_no_route: AtomicU64,
+    /// TX: frames dropped because the BPF→TX channel was full.
+    pub tx_chan_drops: AtomicU64,
 }
 
 /// Maximum UDP datagram size: full 16-bit UDP length field.
@@ -262,17 +264,30 @@ impl VxlanServer {
         // BPF read task: drain frames from the BPF device as fast as possible.
         let bpf_read_task = {
             let mut reader = bpf_reader;
+            let stats = stats.clone();
             tokio::spawn(async move {
                 let mut feth_buf = vec![0u8; MAX_ETHER_BUF];
                 loop {
                     let n = reader.recv(&mut feth_buf).await?;
-                    if bpf_tx.send(feth_buf[..n].to_vec()).await.is_err() {
-                        break;
+                    if let Err(e) = bpf_tx.try_send(feth_buf[..n].to_vec()) {
+                        match e {
+                            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                                stats.tx_chan_drops.fetch_add(1, Relaxed);
+                            }
+                            tokio::sync::mpsc::error::TrySendError::Closed(_) => break,
+                        }
                     }
                     // Drain remaining buffered BPF frames without waiting for I/O.
                     while let Some(n) = reader.try_next_frame(&mut feth_buf)? {
-                        if bpf_tx.send(feth_buf[..n].to_vec()).await.is_err() {
-                            return Ok(());
+                        if let Err(e) = bpf_tx.try_send(feth_buf[..n].to_vec()) {
+                            match e {
+                                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                                    stats.tx_chan_drops.fetch_add(1, Relaxed);
+                                }
+                                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                                    return Ok(());
+                                }
+                            }
                         }
                     }
                 }

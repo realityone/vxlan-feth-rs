@@ -45,6 +45,7 @@ pub struct StatsInfo {
     pub tx_bytes: u64,
     pub tx_errors: u64,
     pub tx_no_route: u64,
+    pub tx_chan_drops: u64,
 }
 
 #[tarpc::service]
@@ -105,6 +106,7 @@ impl Inspect for InspectServer {
             tx_bytes: self.stats.tx_bytes.load(Relaxed),
             tx_errors: self.stats.tx_errors.load(Relaxed),
             tx_no_route: self.stats.tx_no_route.load(Relaxed),
+            tx_chan_drops: self.stats.tx_chan_drops.load(Relaxed),
         }
     }
 }
