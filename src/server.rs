@@ -35,8 +35,6 @@ pub struct TunnelStats {
     pub tx_bytes: AtomicU64,
     /// TX: send errors.
     pub tx_errors: AtomicU64,
-    /// TX: packets suppressed by split-horizon.
-    pub tx_split_horizon: AtomicU64,
     /// TX: packets dropped due to empty FDB lookup.
     pub tx_no_route: AtomicU64,
 }
@@ -153,24 +151,6 @@ impl Fdb {
         }
     }
 
-    /// Return the VTEP IP a source MAC was learned from, if not expired.
-    fn learned_peer_ip(&self, src_mac: [u8; 6]) -> Option<std::net::IpAddr> {
-        let table = self.learned.read().unwrap();
-        match table.get(&src_mac) {
-            Some(&(ip, ts)) if ts.elapsed() < LEARNED_MAC_TTL => Some(ip),
-            Some(&(ip, ts)) => {
-                tracing::trace!(
-                    mac = %config::format_mac(&src_mac),
-                    peer_ip = %ip,
-                    age_secs = ts.elapsed().as_secs(),
-                    "learned entry expired",
-                );
-                None
-            }
-            _ => None,
-        }
-    }
-
     /// Look up destinations for a destination MAC.
     ///
     /// Resolution order (mirrors Linux `vxlan_xmit`):
@@ -258,38 +238,11 @@ impl VxlanServer {
         &self.stats
     }
 
-    /// Send a raw Ethernet frame to all BUM peers via VXLAN encapsulation.
-    pub async fn flood_frame(&self, frame: &[u8]) {
-        let vxlan_hdr = VxlanHdr::new(self.vni);
-        let hdr_bytes = vxlan_hdr.as_bytes();
-        self.socket.writable().await.ok();
-
-        for &remote in &self.fdb.bum {
-            let result = self.socket.try_io(Interest::WRITABLE, || {
-                sendmsg_udp(self.socket.as_raw_fd(), &[hdr_bytes, frame], remote)
-            });
-            if let Err(e) = result {
-                tracing::warn!(remote = %remote, error = %e, "failed to flood frame");
-            }
-        }
-    }
-
     /// Run the server, forwarding packets in both directions until cancelled.
-    ///
-    /// The `on_ready` callback is invoked with a reference to the server after
-    /// binding but before entering the main loop, giving the caller a chance to
-    /// send initial packets (e.g. gratuitous ARP).
     ///
     /// After each readiness notification, drains all available packets before
     /// re-entering the event loop to reduce epoll overhead.
-    pub async fn run<F>(mut self, on_ready: F) -> io::Result<()>
-    where
-        F: for<'a> FnOnce(
-            &'a Self,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>,
-    {
-        on_ready(&self).await;
-
+    pub async fn run(mut self) -> io::Result<()> {
         let vxlan_hdr = VxlanHdr::new(self.vni);
         let mut udp_buf = vec![0u8; MAX_UDP_BUF];
         let mut feth_buf = vec![0u8; MAX_ETHER_BUF];
@@ -368,16 +321,13 @@ impl VxlanServer {
     ///
     /// Uses `sendmsg` with `iovec` to scatter-gather the VXLAN header and
     /// inner frame, avoiding a copy into a contiguous buffer.
-    ///
-    /// Split-horizon: if the frame's source MAC was learned from a remote VTEP,
-    /// that VTEP is excluded from the flood list to prevent loops.
     async fn handle_tx(&self, vxlan_hdr: &VxlanHdr, frame: &[u8]) {
         if frame.len() < protocol::ETH_HEADER_LEN {
             return;
         }
 
-        let (dst_mac, src_mac) = match EthernetHeader::from_bytes(frame) {
-            Ok((eth, _)) => (eth.dst_mac, eth.src_mac),
+        let dst_mac = match EthernetHeader::from_bytes(frame) {
+            Ok((eth, _)) => eth.dst_mac,
             Err(_) => return,
         };
 
@@ -388,24 +338,10 @@ impl VxlanServer {
             return;
         }
 
-        // Split-horizon: skip the VTEP this source MAC was learned from.
-        let exclude_ip = self.fdb.learned_peer_ip(src_mac);
-
         let hdr_bytes = vxlan_hdr.as_bytes();
         self.socket.writable().await.ok();
 
         for &remote in destinations {
-            if exclude_ip == Some(remote.ip()) {
-                tracing::trace!(
-                    src = %config::format_mac(&src_mac),
-                    dst = %config::format_mac(&dst_mac),
-                    remote = %remote,
-                    "split-horizon: skipping originating VTEP",
-                );
-                self.stats.tx_split_horizon.fetch_add(1, Relaxed);
-                continue;
-            }
-
             let result = self.socket.try_io(Interest::WRITABLE, || {
                 sendmsg_udp(self.socket.as_raw_fd(), &[hdr_bytes, frame], remote)
             });

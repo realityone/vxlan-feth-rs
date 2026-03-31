@@ -44,7 +44,6 @@ pub struct StatsInfo {
     pub tx_packets: u64,
     pub tx_bytes: u64,
     pub tx_errors: u64,
-    pub tx_split_horizon: u64,
     pub tx_no_route: u64,
 }
 
@@ -105,7 +104,6 @@ impl Inspect for InspectServer {
             tx_packets: self.stats.tx_packets.load(Relaxed),
             tx_bytes: self.stats.tx_bytes.load(Relaxed),
             tx_errors: self.stats.tx_errors.load(Relaxed),
-            tx_split_horizon: self.stats.tx_split_horizon.load(Relaxed),
             tx_no_route: self.stats.tx_no_route.load(Relaxed),
         }
     }

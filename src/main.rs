@@ -3,7 +3,7 @@ pub mod inspect;
 pub mod protocol;
 pub mod server;
 
-use std::{net::Ipv4Addr, path::PathBuf};
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use feth_rs::builder::{Backend, FethBuilder, FethHandle};
@@ -58,10 +58,6 @@ enum InspectQuery {
 struct InterfaceSetup {
     feth_io: FethHandle,
     feth_ip: FethHandle,
-    /// MAC address assigned to the IP-side interface.
-    ip_mac: MacAddr,
-    /// Overlay IPv4 address.
-    ip_addr: Ipv4Addr,
 }
 
 /// Create and configure the feth pair from config using the ifconfig backend.
@@ -89,9 +85,6 @@ fn setup_interfaces(
     let (addr, prefix) = ip_cfg
         .parse_address()
         .map_err(|e| feth_rs::feth::Error::InvalidName(e.to_string()))?;
-    let ip_addr: Ipv4Addr = addr
-        .parse()
-        .map_err(|e: std::net::AddrParseError| feth_rs::feth::Error::InvalidName(e.to_string()))?;
 
     // Create IP-side feth first (no peer needed).
     let feth_ip = FethBuilder::new()
@@ -124,8 +117,6 @@ fn setup_interfaces(
     Ok(InterfaceSetup {
         feth_io,
         feth_ip,
-        ip_mac,
-        ip_addr,
     })
 }
 
@@ -134,8 +125,6 @@ async fn cmd_server_up(config_path: PathBuf) -> std::io::Result<()> {
     tracing::info!(path = %config_path.display(), "loaded config");
 
     let iface_setup = setup_interfaces(&config.interface).map_err(std::io::Error::other)?;
-
-    let garp = protocol::ArpFrame::gratuitous(&iface_setup.ip_mac.0, iface_setup.ip_addr);
 
     let server = server::VxlanServer::bind(&config).await?;
 
@@ -158,10 +147,7 @@ async fn cmd_server_up(config_path: PathBuf) -> std::io::Result<()> {
     }
 
     let result = tokio::select! {
-        result = server.run(|srv| Box::pin(async move {
-            tracing::info!("sending gratuitous ARP to BUM peers");
-            srv.flood_frame(garp.as_bytes()).await;
-        })) => result,
+        result = server.run() => result,
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("shutting down");
             Ok(())
@@ -220,10 +206,7 @@ async fn cmd_inspect(server: PathBuf, query: InspectQuery) -> std::io::Result<()
                 "TX: {} packets, {} bytes, {} errors",
                 stats.tx_packets, stats.tx_bytes, stats.tx_errors
             );
-            println!(
-                "    split-horizon: {}, no-route: {}",
-                stats.tx_split_horizon, stats.tx_no_route
-            );
+            println!("    no-route: {}", stats.tx_no_route);
         }
     }
     Ok(())
